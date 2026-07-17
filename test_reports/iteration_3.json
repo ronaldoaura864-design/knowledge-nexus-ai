@@ -1,0 +1,39 @@
+{
+  "summary": "Full re-test of Knowledge-Nexus AI after async-generation fix. Backend: 15/15 pytest tests pass — POST /api/projects/generate returns immediately with status='generating', background task calls real GPT-5.2, GET /api/projects/{id} transitions to 'ready' with valid html/css/js containing #home #about #services #contact sections. Frontend: complete Dashboard → New Project dialog → Builder loading → polling → iframe preview → HTML/CSS/JS tabs → Copy → Download → Regenerate → Back → Delete flow verified via Playwright with a real GPT-5.2 generation (105s). Landing page renders, theme toggle switches dark/light on <html>. No 502 seen on generate. All auth guards return 401 without token.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_knowledge_nexus_backend.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py line 297: asyncio.create_task(_run_generation(...)) is not tracked. On uvicorn worker shutdown / hot-reload, in-flight generations are silently orphaned, leaving projects stuck at status='generating' forever. Consider persisting a job timestamp and adding a startup sweeper that marks stale 'generating' docs as 'failed' after N minutes, or use a background task queue.",
+    "server.py list_projects (line 307-311): iterates results in Python to blank html/css/js. For large lists this is fine but the projection `{'_id': 0}` should also exclude these fields at Mongo level (projection {'_id':0,'html':0,'css':0,'js':0}) to save bandwidth.",
+    "server.py get_current_user (line 82-86): naive isoformat() parse can fail on tz-naive strings under Python <3.11 style; current code handles it, but consider storing expires_at as native BSON date and comparing directly.",
+    "Frontend Builder.jsx polling interval (2500ms) has no exponential backoff and no max attempts — if backend never transitions status, the tab polls forever. Add a hard timeout (e.g., 5min) that flips to a 'timed out — retry' state.",
+    "Frontend Builder.jsx handleRegenerate: after POST it does one immediate fetchProject() then startPolling(); briefly the project may still be 'ready' (if backend hasn't yet flipped to 'generating' due to task scheduling race), causing the loader not to show. Consider optimistically setting local status='generating' before polling.",
+    "auth_testing.md references domain 'your app' — should list the actual preview domain."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_knowledge_nexus_backend.py"
+  ],
+  "success_rate": {
+    "backend": "100% (15/15 pytest tests passed, incl. real GPT-5.2 generation)",
+    "frontend": "100% (13/13 UI flows verified end-to-end)"
+  },
+  "test_credentials": "Session created via mongosh: session_token=test_session_fe_1784278633843 (user_id=test-user-fe-1784278633843). Backend pytest suite auto-provisions its own session per run via conftest fixture.",
+  "seed_data_creation": "Frontend test session inserted into MongoDB test_database.users + test_database.user_sessions (7-day expiry). Backend test fixture auto-creates + cleans up its own session per run.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Async generation pattern is now fully working: POST /api/projects/generate returns {project_id, status:'generating'} in <1s, background task takes ~60-120s. Backend tests use polling in test_poll_until_ready (240s deadline). Frontend polls every 2.5s and swaps loader → iframe when status='ready'. Real GPT-5.2 output verified: 11KB HTML with all 4 sections + nav + footer, ~4-8KB CSS, ~2KB JS. Auth: use Authorization: Bearer <session_token> for API, or session_token cookie (secure, samesite=None) for browser flows. All 401 guards intact.",
+  "rca of the issue": "Previous iteration's 502 on /api/projects/generate was caused by synchronous LLM call (~2m48s) exceeding ingress proxy timeout (~100s). Fixed in server.py by moving GPT-5.2 call into background asyncio.create_task(_run_generation(...)) and returning {project_id, status:'generating'} immediately (line 297-299). Frontend Builder.jsx polls GET /api/projects/{id} every 2.5s until status becomes 'ready' or 'failed'. Verified: POST now returns in <1s; typical ready poll succeeds after ~90-105s; no more 502."
+}
