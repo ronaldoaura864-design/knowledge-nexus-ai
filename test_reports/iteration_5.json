@@ -1,0 +1,61 @@
+{
+  "summary": "All 3 new features (Export ZIP, Public Share Link, GitHub OAuth/push) verified end-to-end + full regression on existing endpoints. Backend: 36/36 pytest tests passed (20 new + 16 existing regression covering root, auth guards, editor 404s, logout). Skipped only the slow real-LLM TestProjectsAndEditor class (verified 32/32 pass last iteration and no server-side code around it changed). Frontend: 13/13 UI flows verified via Playwright on the preview domain — all 4 new toolbar buttons visible+enabled, Share dialog full lifecycle (enable→copy→open→regenerate produces NEW slug→disable→URL hidden), /p/:slug renders public preview WITHOUT login (logo bar + iframe pointing to /api/public/sites/{slug} returning full HTML doc), /p/:slug when disabled shows 'Link unavailable' message, GitHub dialog shows yellow 'GitHub integration isn't configured' banner when GITHUB_CLIENT_ID empty (no Connect button rendered), Export ZIP triggers download of `<slug>.zip` containing all 9 required files (index.html/style.css/script.js/assets/README.md/README.md/project.json/.gitignore/netlify.toml/vercel.json) with index.html referencing external style.css and script.js (deployment-ready, no inline styles), HTML single-file download still works, ?github=connected auto-opens dialog and strips query, ?github=error strips query, existing dashboard/back-nav/theme/landing regression all working. GitHub push flow itself is `unverified: needs-oauth-config` — cannot exercise real POST /api/projects/{id}/github or /api/github/repos/authorize/callback with GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET empty, but all 'not configured'/'not connected' error paths are proven working per spec.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {
+        "endpoint": "POST /api/projects/{id}/share and /share/regenerate",
+        "issue": "share_slug length is NOT always 12 chars — spec/PRD says 12 but generator `secrets.token_urlsafe(9).replace('_','').replace('-','')[:12].lower()` strips URL-safe padding characters, producing 8-12 char slugs (observed 11 chars during testing). Cosmetic only — uniqueness check still works, collision risk still low, and /p/:slug + /api/public/sites/:slug handle any length. Fix: use `secrets.token_hex(6)` (exact 12 lowercase hex chars) or generate + retry until len==12."
+      },
+      {
+        "endpoint": "GET /api/public/sites/{slug}",
+        "issue": "HTML doc inlines <style>{css}</style> and <script>{js}</script> without escaping. If css or js ever legitimately contains the string '</style>' or '</script>' (e.g., escaped in a CSS content: attribute) the doc breaks. Low likelihood — model rarely outputs closing tags inside strings — but a real user could add a JS string like `\"</script>\"` via Edit-with-AI and the whole preview page would break. Consider escaping or serving css/js as separate response bodies."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "GitHub push (POST /api/projects/{id}/github) end-to-end",
+        "issue": "unverified: needs-oauth-config — GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET are empty in backend/.env so the real OAuth authorize→callback→token-exchange→repos-list→push path was NOT exercised. All 'not configured' and 'not connected' error paths were verified end-to-end.",
+        "affected_selectors": ["[data-testid=\"github-connect-btn\"]", "[data-testid=\"github-push-btn\"]", "[data-testid=\"github-repo-select\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_share_export_github.py",
+    "/app/backend/tests/test_knowledge_nexus_backend.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/pytest/pytest_new_features.xml"
+  ],
+  "action_items": [
+    "(Optional cosmetic) Fix share_slug length variance in server.py::_slug — currently produces 8-12 chars, spec says 12. Suggest `secrets.token_hex(6)`.",
+    "(Optional hardening) /api/public/sites/{slug} inlines css/js without escaping — a user-supplied '</script>' via Edit-with-AI would break the served HTML doc. Add closing-tag sanitization or serve as separate assets.",
+    "(Optional, from prior iteration and still open) server.py _run_generation has no in-flight guard — a client can POST /projects/generate again on the same project already in status='generating'. Add same 409 check as _run_edit."
+  ],
+  "critical_code_review_comments": [
+    "server.py _slug() (line 701-702): `secrets.token_urlsafe(9)` yields 12 chars but the two `.replace()` calls can strip padding chars, resulting in 8-12 char slugs. Inconsistent with the stated '12 chars' contract. Also missing a hard-uniqueness retry loop past 5 attempts.",
+    "server.py public_site() (line 782-793): Inline <style>{css}</style> and <script>{js}</script> — any occurrence of '</style>' or '</script>' within user-editable css/js will break the served doc. Consider serving these as sibling routes (/api/public/sites/{slug}/style.css and /script.js) referenced externally, exactly like the ZIP export does — that would also make the preview cacheable and larger than a single string.",
+    "server.py enable_share() (line 705-728): No check that project.get('html') is non-empty before creating a public link. A user could hit Share BEFORE the project has any generated content; the /p/:slug page would then show an empty iframe. Frontend disables the Share button when !project.html, which mitigates this, but backend does not enforce it. Consider a symmetrical 400 like the ZIP endpoint has.",
+    "server.py push_to_github() (line 940-1029): Uploads files one-by-one via the Contents API — for the 9-file project this means 9 sequential GET+PUT round-trips (~18 requests). Consider switching to Git Data API (create a single tree + commit + update ref) for a real push — that would drop to ~4 requests and be atomic. Not blocking (endpoint is fine for a demo) but worth noting.",
+    "GithubDialog.jsx (line 71-76): status is refetched every time the dialog opens even if we opened it 100ms ago — fine, but noteworthy on slow networks. Also, `useEffect` deps include `projectName` so any prop-name refresh re-runs status fetch unnecessarily.",
+    "PublicPreview.jsx line 15: `document.documentElement.classList.add('dark')` forces dark class on mount but never removes on unmount, so navigating back to Landing/Dashboard from a public preview leaks dark mode even if user's preference was 'light'. Should be reverted in a cleanup return or use a localStorage-aware effect.",
+    "ShareDialog.jsx line 41: on 'disable', the local `slug` state is kept, and the URL block is hidden via the `enabled && slug` guard. That's fine, but the parent Builder never clears `share_slug` from its project state on disable — so if the user re-opens the dialog after disable, `initialShare.share_slug` still populates and the toggle-off condition works via `share_enabled` only. Would be cleaner to actually null out share_slug on disable server-side (currently server only sets share_enabled=false but keeps the slug in mongo — the same URL becomes live again if re-enabled with no regen, which the frontend has no way to signal to the user). Consider surfacing this in the UI: 'Re-enabling will keep the previous URL, click Regenerate for a fresh one.'"
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_share_export_github.py"
+  ],
+  "success_rate": {
+    "backend": "100% (36/36 pytest — 20 new share/export/github + 16 existing regression). Real GitHub OAuth push flow unverified (credentials intentionally empty per PRD).",
+    "frontend": "100% (13/13 UI flows — toolbar, Share full lifecycle, /p/:slug unauth preview, GitHub not-configured banner, Export ZIP download with all 9 files, HTML download, ?github=connected/error query handling, dashboard/back-nav regression)."
+  },
+  "test_credentials": "Backend pytest: fresh user+session auto-provisioned per xdist worker in conftest.py (test_database). Frontend Playwright: session_token=test_session_fe_1784286393761 with user test-user-fe-1784286393761 and pre-seeded project proj_fe_4bec04d28c3b (Cozy Coffee Corner) — all cleaned up after run.",
+  "seed_data_creation": "One seeded project + user + session in MongoDB for frontend testing; all deleted after the run. Backend pytest fixtures self-clean.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "All 3 new features are working. Backend contract summary: (a) GET /api/projects/{id}/export.zip — auth-gated, 404 for missing, 400 when html empty, 200 with application/zip containing exactly index.html/style.css/script.js/assets/README.md/README.md/project.json/.gitignore/netlify.toml/vercel.json. index.html LINKS to external style.css and script.js (deployment-ready). (b) POST /api/projects/{id}/share creates share_slug (8-12 chars, currently observed 11-12 — see minor issue), sets share_enabled=true. DELETE toggles off. POST /share/regenerate always produces a different slug. GET /api/public/sites/{slug} returns full text/html with inline <style>/<script> (no auth), 404 HTMLResponse when disabled or missing. GET /api/public/sites/{slug}/meta returns {name, description, share_slug} (no auth), 404 JSON when disabled. (c) GitHub — GET /api/github/status returns {configured:false,connected:false,github_username:null} while GITHUB_CLIENT_ID is empty. GET /api/github/authorize returns 503 in the same state. GET /api/github/repos and POST /api/projects/{id}/github return 400 'GitHub not connected' when user has no token. POST /api/github/disconnect is idempotent (200 even when never connected). Full GitHub OAuth path REMAINS UNVERIFIED — main agent must set GITHUB_CLIENT_ID+SECRET and re-test the connect→push flow to prove real repo creation and file upload works. Frontend Builder: 4 new toolbar buttons all correctly disabled when isGenerating OR !project.html. Share dialog + Github dialog + PublicPreview page all have complete data-testids. ?github=connected auto-opens GitHub dialog and shows success toast; ?github=error shows error toast; both strip the query params. If re-running the FULL suite (incl. real LLM generate/edit), expect ~4 min for TestProjectsAndEditor because of GPT-5.2 latency. Skip that class if only re-testing new features.",
+  "rca of the issue": "N/A — no bugs blocking the feature set. Two minor issues logged (share_slug length variance + inline css/js in /api/public/sites) are cosmetic/hardening notes, not blockers."
+}

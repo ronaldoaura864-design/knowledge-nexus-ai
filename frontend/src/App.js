@@ -6,6 +6,7 @@ import { Landing } from "@/pages/Landing";
 import { Dashboard } from "@/pages/Dashboard";
 import { Builder } from "@/pages/Builder";
 import { AuthCallback } from "@/pages/AuthCallback";
+import { PublicPreview } from "@/pages/PublicPreview";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { Toaster } from "sonner";
 
@@ -28,6 +29,7 @@ const AppRouter = () => {
   return (
     <Routes>
       <Route path="/" element={<Landing />} />
+      <Route path="/p/:slug" element={<PublicPreview />} />
       <Route
         path="/dashboard"
         element={

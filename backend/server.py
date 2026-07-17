@@ -1,4 +1,5 @@
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, Header, Depends
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -6,6 +7,10 @@ import os
 import logging
 import json
 import re
+import io
+import base64
+import zipfile
+import secrets
 import uuid
 from pathlib import Path
 from pydantic import BaseModel, Field
@@ -24,6 +29,8 @@ client = AsyncIOMotorClient(mongo_url)
 db = client[os.environ["DB_NAME"]]
 
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
+GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
+GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -56,6 +63,13 @@ class EditRequest(BaseModel):
 
 class RevertRequest(BaseModel):
     version_id: str
+
+
+class GithubPushRequest(BaseModel):
+    repo_name: str
+    private: bool = False
+    existing: bool = False
+    commit_message: Optional[str] = "Update from Knowledge-Nexus AI"
 
 
 class Project(BaseModel):
@@ -545,7 +559,474 @@ async def delete_project(project_id: str, user: User = Depends(get_current_user)
     )
     if res.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Project not found")
+    await db.project_versions.delete_many(
+        {"project_id": project_id, "user_id": user.user_id}
+    )
     return {"ok": True}
+
+
+# ============ Export: ZIP ============
+def _build_project_files(project: dict) -> dict:
+    """Return dict of filename -> file content (str or bytes) for a deployable static site."""
+    name = project.get("name") or "site"
+    safe_name = re.sub(r"[^a-zA-Z0-9-]+", "-", name).strip("-").lower() or "site"
+    description = project.get("description") or ""
+    html_body = project.get("html") or ""
+    css = project.get("css") or ""
+    js = project.get("js") or ""
+
+    index_html = (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '  <meta charset="utf-8" />\n'
+        '  <meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        f'  <meta name="description" content="{description}" />\n'
+        f"  <title>{name}</title>\n"
+        '  <link rel="stylesheet" href="style.css" />\n'
+        "</head>\n"
+        "<body>\n"
+        f"{html_body}\n"
+        '  <script src="script.js"></script>\n'
+        "</body>\n"
+        "</html>\n"
+    )
+
+    readme = (
+        f"# {name}\n\n"
+        f"{description}\n\n"
+        "Generated with **Knowledge-Nexus AI**.\n\n"
+        "## Files\n\n"
+        "- `index.html` — main page\n"
+        "- `style.css` — styles\n"
+        "- `script.js` — interactivity\n"
+        "- `assets/` — put images / fonts / other static files here\n\n"
+        "## Deploy\n\n"
+        "This project is ready to deploy on:\n\n"
+        "- **GitHub Pages** — push to a repo and enable Pages on the main branch.\n"
+        "- **Netlify** — `netlify.toml` is pre-configured. Drag the folder into Netlify or connect the repo.\n"
+        "- **Vercel** — `vercel.json` is pre-configured. `vercel --prod` from this directory.\n\n"
+        "## Local preview\n\n"
+        "Open `index.html` in a browser, or run any static server:\n\n"
+        "```bash\n"
+        "python3 -m http.server 8080\n"
+        "```\n"
+    )
+
+    metadata = {
+        "name": name,
+        "description": description,
+        "project_id": project.get("project_id"),
+        "prompt": project.get("prompt", ""),
+        "generated_at": project.get("created_at"),
+        "updated_at": project.get("updated_at"),
+        "current_version_id": project.get("current_version_id"),
+        "generator": "Knowledge-Nexus AI",
+    }
+
+    gitignore = (
+        "# OS\n.DS_Store\nThumbs.db\n\n"
+        "# Editors\n.vscode/\n.idea/\n\n"
+        "# Node/Vercel\nnode_modules/\n.vercel/\n\n"
+        "# Netlify\n.netlify/\n"
+    )
+
+    netlify_toml = (
+        "[build]\n"
+        '  publish = "."\n\n'
+        "[[headers]]\n"
+        '  for = "/*"\n'
+        "  [headers.values]\n"
+        '    X-Frame-Options = "SAMEORIGIN"\n'
+        '    Referrer-Policy = "no-referrer-when-downgrade"\n'
+    )
+
+    vercel_json = json.dumps(
+        {
+            "version": 2,
+            "cleanUrls": True,
+            "trailingSlash": False,
+            "builds": [{"src": "**/*", "use": "@vercel/static"}],
+        },
+        indent=2,
+    )
+
+    assets_readme = (
+        "# assets/\n\n"
+        "Place images, fonts, videos or other static files here.\n"
+        "Reference them from `index.html` or `style.css` with relative paths, e.g. `assets/logo.png`.\n"
+    )
+
+    return {
+        "index.html": index_html,
+        "style.css": css or "/* your styles */\n",
+        "script.js": js or "// your JS\n",
+        "assets/README.md": assets_readme,
+        "README.md": readme,
+        "project.json": json.dumps(metadata, indent=2),
+        ".gitignore": gitignore,
+        "netlify.toml": netlify_toml,
+        "vercel.json": vercel_json,
+    }, safe_name
+
+
+@api_router.get("/projects/{project_id}/export.zip")
+async def export_project_zip(project_id: str, user: User = Depends(get_current_user)):
+    project = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.get("html"):
+        raise HTTPException(status_code=400, detail="Project has no generated content yet")
+
+    files, safe_name = _build_project_files(project)
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            zf.writestr(path, data)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.zip"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+# ============ Public Share Link ============
+def _slug() -> str:
+    return secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12].lower()
+
+
+@api_router.post("/projects/{project_id}/share")
+async def enable_share(project_id: str, user: User = Depends(get_current_user)):
+    project = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    slug = project.get("share_slug")
+    if not slug:
+        # Ensure uniqueness
+        for _ in range(5):
+            candidate = _slug()
+            existing = await db.projects.find_one({"share_slug": candidate})
+            if not existing:
+                slug = candidate
+                break
+        if not slug:
+            raise HTTPException(status_code=500, detail="Could not allocate slug")
+
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {"$set": {"share_slug": slug, "share_enabled": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return {"share_enabled": True, "share_slug": slug}
+
+
+@api_router.post("/projects/{project_id}/share/regenerate")
+async def regenerate_share(project_id: str, user: User = Depends(get_current_user)):
+    project = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    slug = None
+    for _ in range(5):
+        candidate = _slug()
+        existing = await db.projects.find_one({"share_slug": candidate})
+        if not existing:
+            slug = candidate
+            break
+    if not slug:
+        raise HTTPException(status_code=500, detail="Could not allocate slug")
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {"$set": {"share_slug": slug, "share_enabled": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return {"share_enabled": True, "share_slug": slug}
+
+
+@api_router.delete("/projects/{project_id}/share")
+async def disable_share(project_id: str, user: User = Depends(get_current_user)):
+    result = await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {"$set": {"share_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Project not found")
+    return {"share_enabled": False}
+
+
+@api_router.get("/public/sites/{slug}", response_class=HTMLResponse)
+async def public_site(slug: str):
+    """Serve the generated site as a full HTML document. Anonymous — no auth."""
+    project = await db.projects.find_one(
+        {"share_slug": slug, "share_enabled": True}, {"_id": 0}
+    )
+    if not project:
+        return HTMLResponse(
+            "<!doctype html><html><body style='font-family:sans-serif;padding:40px;'>"
+            "<h1>Not available</h1><p>This share link is disabled or does not exist.</p></body></html>",
+            status_code=404,
+        )
+    name = project.get("name") or "Preview"
+    description = project.get("description") or ""
+    html_body = project.get("html") or ""
+    css = project.get("css") or ""
+    js = project.get("js") or ""
+    doc = (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8" />\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        f'<meta name="description" content="{description}" />\n'
+        f"<title>{name}</title>\n"
+        f"<style>{css}</style>\n"
+        "</head>\n"
+        f"<body>\n{html_body}\n<script>{js}</script>\n</body>\n</html>\n"
+    )
+    return HTMLResponse(content=doc, headers={"Cache-Control": "no-store"})
+
+
+@api_router.get("/public/sites/{slug}/meta")
+async def public_site_meta(slug: str):
+    """Lightweight metadata for the /p/:slug React page (no auth)."""
+    project = await db.projects.find_one(
+        {"share_slug": slug, "share_enabled": True}, {"_id": 0, "user_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Not available")
+    return {
+        "name": project.get("name"),
+        "description": project.get("description"),
+        "share_slug": slug,
+    }
+
+
+# ============ GitHub OAuth + Push ============
+def _base_url(request: Request) -> str:
+    return str(request.base_url).rstrip("/")
+
+
+@api_router.get("/github/status")
+async def github_status(user: User = Depends(get_current_user)):
+    doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    configured = bool(GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET)
+    return {
+        "configured": configured,
+        "connected": bool(doc and doc.get("github_access_token")),
+        "github_username": doc.get("github_username") if doc else None,
+    }
+
+
+@api_router.get("/github/authorize")
+async def github_authorize(
+    request: Request,
+    project_id: Optional[str] = None,
+    user: User = Depends(get_current_user),
+):
+    if not (GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET):
+        raise HTTPException(status_code=503, detail="GitHub integration not configured on this server")
+    state = secrets.token_urlsafe(24)
+    await db.oauth_states.insert_one(
+        {
+            "state": state,
+            "user_id": user.user_id,
+            "project_id": project_id,
+            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    redirect_uri = f"{_base_url(request)}/api/github/callback"
+    params = {
+        "client_id": GITHUB_CLIENT_ID,
+        "redirect_uri": redirect_uri,
+        "scope": "repo",
+        "state": state,
+        "allow_signup": "false",
+    }
+    from urllib.parse import urlencode
+    return {"authorize_url": f"https://github.com/login/oauth/authorize?{urlencode(params)}"}
+
+
+@api_router.get("/github/callback")
+async def github_callback(request: Request, code: Optional[str] = None, state: Optional[str] = None):
+    frontend_base = _base_url(request)
+    if not (code and state):
+        return RedirectResponse(f"{frontend_base}/dashboard?github=error&reason=missing_params")
+    st = await db.oauth_states.find_one({"state": state}, {"_id": 0})
+    if not st:
+        return RedirectResponse(f"{frontend_base}/dashboard?github=error&reason=invalid_state")
+    await db.oauth_states.delete_one({"state": state})
+    user_id = st["user_id"]
+    project_id = st.get("project_id")
+    redirect_uri = f"{frontend_base}/api/github/callback"
+
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": GITHUB_CLIENT_ID,
+                "client_secret": GITHUB_CLIENT_SECRET,
+                "code": code,
+                "redirect_uri": redirect_uri,
+            },
+        )
+        if r.status_code != 200:
+            return RedirectResponse(f"{frontend_base}/dashboard?github=error&reason=token_exchange")
+        token_data = r.json()
+        access_token = token_data.get("access_token")
+        if not access_token:
+            return RedirectResponse(f"{frontend_base}/dashboard?github=error&reason=no_token")
+
+        u = await http.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+        )
+        gh_username = u.json().get("login") if u.status_code == 200 else None
+
+    await db.users.update_one(
+        {"user_id": user_id},
+        {
+            "$set": {
+                "github_access_token": access_token,
+                "github_username": gh_username,
+                "github_connected_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+
+    dest = f"/builder/{project_id}" if project_id else "/dashboard"
+    return RedirectResponse(f"{frontend_base}{dest}?github=connected")
+
+
+@api_router.post("/github/disconnect")
+async def github_disconnect(user: User = Depends(get_current_user)):
+    await db.users.update_one(
+        {"user_id": user.user_id},
+        {"$unset": {"github_access_token": "", "github_username": "", "github_connected_at": ""}},
+    )
+    return {"ok": True}
+
+
+@api_router.get("/github/repos")
+async def github_repos(user: User = Depends(get_current_user)):
+    doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    token = doc.get("github_access_token") if doc else None
+    if not token:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+    async with httpx.AsyncClient(timeout=15.0) as http:
+        r = await http.get(
+            "https://api.github.com/user/repos",
+            params={"per_page": 100, "sort": "updated", "affiliation": "owner"},
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        if r.status_code != 200:
+            raise HTTPException(status_code=502, detail="GitHub API error")
+        repos = [
+            {"name": it["name"], "full_name": it["full_name"], "private": it["private"], "html_url": it["html_url"]}
+            for it in r.json()
+        ]
+    return {"repos": repos, "username": doc.get("github_username")}
+
+
+@api_router.post("/projects/{project_id}/github")
+async def push_to_github(
+    project_id: str,
+    req: GithubPushRequest,
+    user: User = Depends(get_current_user),
+):
+    doc = await db.users.find_one({"user_id": user.user_id}, {"_id": 0})
+    token = doc.get("github_access_token") if doc else None
+    username = doc.get("github_username") if doc else None
+    if not token or not username:
+        raise HTTPException(status_code=400, detail="GitHub not connected")
+
+    project = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not project.get("html"):
+        raise HTTPException(status_code=400, detail="Project has no generated content yet")
+
+    files, _ = _build_project_files(project)
+    repo_name = re.sub(r"[^a-zA-Z0-9._-]+", "-", req.repo_name).strip("-")[:80]
+    if not repo_name:
+        raise HTTPException(status_code=400, detail="Invalid repo name")
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async with httpx.AsyncClient(timeout=30.0) as http:
+        # Create repo if requested
+        if not req.existing:
+            r = await http.post(
+                "https://api.github.com/user/repos",
+                headers=headers,
+                json={
+                    "name": repo_name,
+                    "private": req.private,
+                    "description": (project.get("description") or "")[:200],
+                    "auto_init": True,
+                },
+            )
+            if r.status_code not in (200, 201):
+                detail = r.json().get("message", "Failed to create repo")
+                raise HTTPException(status_code=r.status_code, detail=f"GitHub: {detail}")
+
+        # Get default branch
+        rp = await http.get(f"https://api.github.com/repos/{username}/{repo_name}", headers=headers)
+        if rp.status_code != 200:
+            raise HTTPException(status_code=rp.status_code, detail="Could not read target repo")
+        default_branch = rp.json().get("default_branch", "main")
+
+        # Upload each file via Contents API
+        for path, content in files.items():
+            data = content.encode("utf-8") if isinstance(content, str) else content
+            b64 = base64.b64encode(data).decode("ascii")
+            # Check if file exists to grab sha
+            existing_sha = None
+            g = await http.get(
+                f"https://api.github.com/repos/{username}/{repo_name}/contents/{path}",
+                params={"ref": default_branch},
+                headers=headers,
+            )
+            if g.status_code == 200:
+                existing_sha = g.json().get("sha")
+
+            body = {
+                "message": req.commit_message or "Update from Knowledge-Nexus AI",
+                "content": b64,
+                "branch": default_branch,
+            }
+            if existing_sha:
+                body["sha"] = existing_sha
+            put = await http.put(
+                f"https://api.github.com/repos/{username}/{repo_name}/contents/{path}",
+                headers=headers,
+                json=body,
+            )
+            if put.status_code not in (200, 201):
+                detail = put.json().get("message", "Failed to push file")
+                raise HTTPException(status_code=put.status_code, detail=f"GitHub ({path}): {detail}")
+
+    repo_url = f"https://github.com/{username}/{repo_name}"
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {"$set": {"github_repo": f"{username}/{repo_name}", "github_repo_url": repo_url, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return {"ok": True, "repo": f"{username}/{repo_name}", "html_url": repo_url, "branch": default_branch}
 
 
 app.include_router(api_router)

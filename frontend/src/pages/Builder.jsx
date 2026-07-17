@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useParams, useNavigate, Link } from "react-router-dom";
+import { useParams, useNavigate, Link, useSearchParams } from "react-router-dom";
 import { Navbar } from "@/components/Navbar";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { api } from "@/lib/api";
+import { api, API } from "@/lib/api";
 import { toast } from "sonner";
 import {
   ArrowLeft,
@@ -16,10 +16,15 @@ import {
   Sparkles,
   AlertTriangle,
   Wand2,
+  Share2,
+  Github,
+  Package,
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { EditWithAIDialog } from "@/components/EditWithAIDialog";
 import { VersionControls } from "@/components/VersionControls";
+import { ShareDialog } from "@/components/ShareDialog";
+import { GithubDialog } from "@/components/GithubDialog";
 
 const buildFullHtml = (p) => `<!doctype html>
 <html lang="en">
@@ -44,11 +49,31 @@ export const Builder = () => {
   const [prompt, setPrompt] = useState("");
   const [viewport, setViewport] = useState("desktop");
   const [editOpen, setEditOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [githubOpen, setGithubOpen] = useState(false);
   const [compareVersionId, setCompareVersionId] = useState(null);
   const [compareVersion, setCompareVersion] = useState(null);
   const [versionsRefreshKey, setVersionsRefreshKey] = useState(0);
   const pollRef = useRef(null);
   const toastedRef = useRef(false);
+  const [searchParams, setSearchParams] = useSearchParams();
+
+  // Auto-open GitHub dialog after successful OAuth redirect
+  useEffect(() => {
+    const gh = searchParams.get("github");
+    if (gh === "connected") {
+      setGithubOpen(true);
+      toast.success("GitHub connected!");
+      searchParams.delete("github");
+      setSearchParams(searchParams, { replace: true });
+    } else if (gh === "error") {
+      toast.error("GitHub connection failed");
+      searchParams.delete("github");
+      searchParams.delete("reason");
+      setSearchParams(searchParams, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const fetchProject = async () => {
     const res = await api.get(`/projects/${id}`);
@@ -174,6 +199,27 @@ export const Builder = () => {
     URL.revokeObjectURL(url);
   };
 
+  const exportZip = async () => {
+    try {
+      toast.info("Building your ZIP…");
+      const res = await api.get(`/projects/${id}/export.zip`, { responseType: "blob" });
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      const safe = (project?.name || "site").replace(/[^a-zA-Z0-9-]+/g, "-").toLowerCase();
+      a.download = `${safe}.zip`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("ZIP downloaded");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Export failed");
+    }
+  };
+
+  const handleShareChanged = (share) => {
+    setProject((p) => (p ? { ...p, share_enabled: share.share_enabled, share_slug: share.share_slug } : p));
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen">
@@ -249,13 +295,40 @@ export const Builder = () => {
                 <Wand2 className="w-4 h-4 mr-2" /> Edit with AI
               </Button>
               <Button
+                data-testid="share-btn"
+                variant="outline"
+                onClick={() => setShareOpen(true)}
+                disabled={isGenerating || !project.html}
+                className="rounded-full"
+              >
+                <Share2 className="w-4 h-4 mr-2" /> Share
+              </Button>
+              <Button
+                data-testid="github-btn"
+                variant="outline"
+                onClick={() => setGithubOpen(true)}
+                disabled={isGenerating || !project.html}
+                className="rounded-full"
+              >
+                <Github className="w-4 h-4 mr-2" /> GitHub
+              </Button>
+              <Button
+                data-testid="export-zip-btn"
+                variant="outline"
+                onClick={exportZip}
+                disabled={isGenerating || !project.html}
+                className="rounded-full"
+              >
+                <Package className="w-4 h-4 mr-2" /> Export ZIP
+              </Button>
+              <Button
                 data-testid="download-html-btn"
                 variant="outline"
                 disabled={isGenerating || !project.html}
                 onClick={() => download(fullHtml, `${project.name.replace(/\s+/g, "-")}.html`, "text/html")}
                 className="rounded-full"
               >
-                <Download className="w-4 h-4 mr-2" /> Download
+                <Download className="w-4 h-4 mr-2" /> HTML
               </Button>
             </div>
           </div>
@@ -436,6 +509,19 @@ export const Builder = () => {
         open={editOpen}
         onOpenChange={setEditOpen}
         onEditStarted={handleEditStarted}
+      />
+      <ShareDialog
+        projectId={id}
+        initialShare={{ share_enabled: project.share_enabled, share_slug: project.share_slug }}
+        open={shareOpen}
+        onOpenChange={setShareOpen}
+        onChanged={handleShareChanged}
+      />
+      <GithubDialog
+        projectId={id}
+        projectName={project.name}
+        open={githubOpen}
+        onOpenChange={setGithubOpen}
       />
     </div>
   );
