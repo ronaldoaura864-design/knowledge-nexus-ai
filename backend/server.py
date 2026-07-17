@@ -1532,10 +1532,6 @@ async def public_chat(slug: str):
     if not chat:
         raise HTTPException(status_code=404, detail="Not available")
     msgs = await db.chat_messages.find(
-        {"chat_id": chat["chat_id"], "share_enabled": {"$ne": False}}, {"_id": 0, "user_id": 0}
-    ).sort("created_at", 1).to_list(500)
-    # Not filtering on message; grouped under chat's share
-    msgs = await db.chat_messages.find(
         {"chat_id": chat["chat_id"]}, {"_id": 0, "user_id": 0}
     ).sort("created_at", 1).to_list(500)
     return {"chat": chat, "messages": msgs}
@@ -1563,9 +1559,10 @@ async def export_chat_txt(chat_id: str, user: User = Depends(get_current_user)):
         {"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0}
     ).sort("created_at", 1).to_list(1000)
     text = _chat_to_text(chat, msgs)
+    safe_name = re.sub(r"[^a-z0-9-]+", "-", chat["title"].lower()).strip("-") or "chat"
     return PlainTextResponse(
         content=text,
-        headers={"Content-Disposition": f'attachment; filename="{re.sub(r"[^a-z0-9-]+","-",chat["title"].lower())}.txt"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.txt"'},
     )
 
 

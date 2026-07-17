@@ -25,6 +25,7 @@ import {
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -225,8 +226,6 @@ export const Chat = () => {
   };
 
   const exportTxt = () => {
-    window.open(`${API}/chats/${chatId}/export.txt?token=1`, "_blank");
-    // Since we need auth, use fetch + blob:
     api.get(`/chats/${chatId}/export.txt`, { responseType: "blob" }).then((r) => {
       const url = URL.createObjectURL(r.data);
       const a = document.createElement("a");
@@ -589,6 +588,7 @@ export const Chat = () => {
         <DialogContent data-testid="chat-share-dialog">
           <DialogHeader>
             <DialogTitle>Share this chat</DialogTitle>
+            <DialogDescription>Anyone with the link can read the conversation.</DialogDescription>
           </DialogHeader>
           <div className="space-y-4 pt-2">
             <div className="flex items-center justify-between rounded-xl border border-white/10 p-4">
