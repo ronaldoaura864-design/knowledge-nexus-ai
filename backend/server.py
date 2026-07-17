@@ -50,6 +50,14 @@ class GenerateRequest(BaseModel):
     project_id: Optional[str] = None
 
 
+class EditRequest(BaseModel):
+    prompt: str
+
+
+class RevertRequest(BaseModel):
+    version_id: str
+
+
 class Project(BaseModel):
     project_id: str
     user_id: str
@@ -216,6 +224,56 @@ def _extract_json(text: str) -> dict:
 import asyncio
 
 
+EDIT_SYSTEM_PROMPT = """You are an expert web designer/developer. The user will give you an existing website (html/css/js) and an EDIT INSTRUCTION. Modify ONLY what the instruction asks for. Preserve all other content, structure, and functionality.
+
+Return ONLY valid JSON (no markdown fences, no commentary). Schema:
+{
+  "name": "<project name — keep existing unless user asks to rename>",
+  "description": "<one-sentence description — keep or refine>",
+  "html": "complete updated body markup (NO <html>/<head>/<body>/<style>/<script> tags). Must still contain <nav>, four <section id='home|about|services|contact'>, and <footer>. Add new sections if requested.",
+  "css": "complete updated CSS",
+  "js": "complete updated vanilla JS"
+}
+
+Rules:
+- Preserve existing text/images/copy unless the instruction changes them.
+- Preserve section IDs (#home #about #services #contact) unless user explicitly renames.
+- If the user asks to ADD a section (e.g. pricing, testimonials, faq, contact form), append it and add it to <nav>.
+- If the user asks a COLOR/FONT/STYLE change, only touch CSS.
+- If they ask for ANIMATION change, update CSS and/or JS.
+- Return full files (not diffs). All three fields must be complete.
+- Output must be strict valid JSON with properly escaped strings."""
+
+
+async def _save_version(project_id: str, user_id: str, action: str, prompt: str, snapshot: dict):
+    """Append a version snapshot to project_versions and update project's version list."""
+    version_id = f"ver_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    await db.project_versions.insert_one(
+        {
+            "version_id": version_id,
+            "project_id": project_id,
+            "user_id": user_id,
+            "action": action,  # "generate" | "edit" | "revert"
+            "prompt": prompt,
+            "name": snapshot.get("name", ""),
+            "description": snapshot.get("description", ""),
+            "html": snapshot.get("html", ""),
+            "css": snapshot.get("css", ""),
+            "js": snapshot.get("js", ""),
+            "created_at": now,
+        }
+    )
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user_id},
+        {
+            "$push": {"version_ids": version_id},
+            "$set": {"current_version_id": version_id, "updated_at": now},
+        },
+    )
+    return version_id
+
+
 async def _run_generation(project_id: str, user_id: str, prompt: str):
     """Background task: call LLM and update project doc."""
     try:
@@ -229,24 +287,80 @@ async def _run_generation(project_id: str, user_id: str, prompt: str):
             UserMessage(text=f"Build a website for: {prompt}\n\nReturn ONLY the JSON object.")
         )
         result = _extract_json(raw if isinstance(raw, str) else str(raw))
+        snapshot = {
+            "name": (result.get("name") or "Untitled Site")[:80],
+            "description": result.get("description", ""),
+            "html": result.get("html", ""),
+            "css": result.get("css", ""),
+            "js": result.get("js", ""),
+        }
         now = datetime.now(timezone.utc).isoformat()
+        await db.projects.update_one(
+            {"project_id": project_id, "user_id": user_id},
+            {"$set": {**snapshot, "status": "ready", "error": None, "updated_at": now}},
+        )
+        await _save_version(project_id, user_id, "generate", prompt, snapshot)
+    except Exception as e:
+        logger.exception("Background generation failed")
         await db.projects.update_one(
             {"project_id": project_id, "user_id": user_id},
             {
                 "$set": {
-                    "name": (result.get("name") or "Untitled Site")[:80],
-                    "description": result.get("description", ""),
-                    "html": result.get("html", ""),
-                    "css": result.get("css", ""),
-                    "js": result.get("js", ""),
-                    "status": "ready",
-                    "error": None,
-                    "updated_at": now,
+                    "status": "failed",
+                    "error": str(e)[:500],
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 }
             },
         )
+
+
+async def _run_edit(project_id: str, user_id: str, prompt: str):
+    """Background task: apply an AI edit to the existing project."""
+    try:
+        proj = await db.projects.find_one(
+            {"project_id": project_id, "user_id": user_id}, {"_id": 0}
+        )
+        if not proj:
+            return
+
+        session_id = f"edit_{uuid.uuid4().hex[:10]}"
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=session_id,
+            system_message=EDIT_SYSTEM_PROMPT,
+        ).with_model("openai", "gpt-5.2")
+
+        current = json.dumps(
+            {
+                "name": proj.get("name", ""),
+                "description": proj.get("description", ""),
+                "html": proj.get("html", ""),
+                "css": proj.get("css", ""),
+                "js": proj.get("js", ""),
+            }
+        )
+        user_text = (
+            f"EDIT INSTRUCTION: {prompt}\n\n"
+            f"CURRENT WEBSITE JSON:\n{current}\n\n"
+            "Apply the instruction and return the updated JSON object with the same schema."
+        )
+        raw = await chat.send_message(UserMessage(text=user_text))
+        result = _extract_json(raw if isinstance(raw, str) else str(raw))
+        snapshot = {
+            "name": (result.get("name") or proj.get("name") or "Untitled Site")[:80],
+            "description": result.get("description", proj.get("description", "")),
+            "html": result.get("html", proj.get("html", "")),
+            "css": result.get("css", proj.get("css", "")),
+            "js": result.get("js", proj.get("js", "")),
+        }
+        now = datetime.now(timezone.utc).isoformat()
+        await db.projects.update_one(
+            {"project_id": project_id, "user_id": user_id},
+            {"$set": {**snapshot, "status": "ready", "error": None, "updated_at": now}},
+        )
+        await _save_version(project_id, user_id, "edit", prompt, snapshot)
     except Exception as e:
-        logger.exception("Background generation failed")
+        logger.exception("Background edit failed")
         await db.projects.update_one(
             {"project_id": project_id, "user_id": user_id},
             {
@@ -297,6 +411,108 @@ async def generate_project(
     asyncio.create_task(_run_generation(project_id, user.user_id, req.prompt))
 
     return {"project_id": project_id, "status": "generating"}
+
+
+@api_router.post("/projects/{project_id}/edit")
+async def edit_project(
+    project_id: str, req: EditRequest, user: User = Depends(get_current_user)
+):
+    """Apply a natural-language edit to an existing project (async)."""
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="LLM key not configured")
+    proj = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if proj.get("status") == "generating":
+        raise HTTPException(status_code=409, detail="A generation is already in progress")
+
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {
+            "$set": {
+                "status": "generating",
+                "error": None,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    )
+    asyncio.create_task(_run_edit(project_id, user.user_id, req.prompt))
+    return {"project_id": project_id, "status": "generating"}
+
+
+@api_router.get("/projects/{project_id}/versions")
+async def list_versions(project_id: str, user: User = Depends(get_current_user)):
+    proj = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    cursor = (
+        db.project_versions.find(
+            {"project_id": project_id, "user_id": user.user_id},
+            {"_id": 0, "html": 0, "css": 0, "js": 0},
+        ).sort("created_at", 1)
+    )
+    versions = await cursor.to_list(500)
+    return {
+        "versions": versions,
+        "current_version_id": proj.get("current_version_id"),
+    }
+
+
+@api_router.get("/projects/{project_id}/versions/{version_id}")
+async def get_version(
+    project_id: str, version_id: str, user: User = Depends(get_current_user)
+):
+    v = await db.project_versions.find_one(
+        {"project_id": project_id, "user_id": user.user_id, "version_id": version_id},
+        {"_id": 0},
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+    return v
+
+
+@api_router.post("/projects/{project_id}/revert")
+async def revert_project(
+    project_id: str, req: RevertRequest, user: User = Depends(get_current_user)
+):
+    """Set the project's active content to a specific version. Non-destructive: does not delete newer versions."""
+    proj = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    if not proj:
+        raise HTTPException(status_code=404, detail="Project not found")
+    v = await db.project_versions.find_one(
+        {"project_id": project_id, "user_id": user.user_id, "version_id": req.version_id},
+        {"_id": 0},
+    )
+    if not v:
+        raise HTTPException(status_code=404, detail="Version not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.projects.update_one(
+        {"project_id": project_id, "user_id": user.user_id},
+        {
+            "$set": {
+                "name": v["name"] or proj.get("name", ""),
+                "description": v.get("description", ""),
+                "html": v.get("html", ""),
+                "css": v.get("css", ""),
+                "js": v.get("js", ""),
+                "status": "ready",
+                "error": None,
+                "current_version_id": req.version_id,
+                "updated_at": now,
+            }
+        },
+    )
+    updated = await db.projects.find_one(
+        {"project_id": project_id, "user_id": user.user_id}, {"_id": 0}
+    )
+    return updated
 
 
 @api_router.get("/projects")

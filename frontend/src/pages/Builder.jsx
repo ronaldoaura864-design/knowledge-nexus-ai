@@ -15,8 +15,11 @@ import {
   Smartphone,
   Sparkles,
   AlertTriangle,
+  Wand2,
 } from "lucide-react";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import { EditWithAIDialog } from "@/components/EditWithAIDialog";
+import { VersionControls } from "@/components/VersionControls";
 
 const buildFullHtml = (p) => `<!doctype html>
 <html lang="en">
@@ -40,6 +43,10 @@ export const Builder = () => {
   const [regenerating, setRegenerating] = useState(false);
   const [prompt, setPrompt] = useState("");
   const [viewport, setViewport] = useState("desktop");
+  const [editOpen, setEditOpen] = useState(false);
+  const [compareVersionId, setCompareVersionId] = useState(null);
+  const [compareVersion, setCompareVersion] = useState(null);
+  const [versionsRefreshKey, setVersionsRefreshKey] = useState(0);
   const pollRef = useRef(null);
   const toastedRef = useRef(false);
 
@@ -57,6 +64,7 @@ export const Builder = () => {
         if (p.status === "ready") {
           clearInterval(pollRef.current);
           pollRef.current = null;
+          setVersionsRefreshKey((k) => k + 1);
           if (!toastedRef.current) {
             toast.success("Website ready!");
             toastedRef.current = true;
@@ -96,7 +104,27 @@ export const Builder = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
 
+  // Load compare version content when compareVersionId changes
+  useEffect(() => {
+    if (!compareVersionId) {
+      setCompareVersion(null);
+      return;
+    }
+    (async () => {
+      try {
+        const res = await api.get(`/projects/${id}/versions/${compareVersionId}`);
+        setCompareVersion(res.data);
+      } catch {
+        setCompareVersion(null);
+      }
+    })();
+  }, [compareVersionId, id]);
+
   const fullHtml = useMemo(() => (project ? buildFullHtml(project) : ""), [project]);
+  const compareHtml = useMemo(
+    () => (compareVersion ? buildFullHtml(compareVersion) : ""),
+    [compareVersion]
+  );
   const isGenerating = project?.status === "generating";
   const hasFailed = project?.status === "failed";
 
@@ -107,14 +135,24 @@ export const Builder = () => {
     toast.info("Regenerating…");
     try {
       await api.post("/projects/generate", { prompt, project_id: id });
-      const p = await fetchProject();
-      setProject(p);
+      setProject((p) => (p ? { ...p, status: "generating" } : p));
       startPolling();
     } catch (err) {
       toast.error(err.response?.data?.detail || "Failed");
     } finally {
       setRegenerating(false);
     }
+  };
+
+  const handleEditStarted = () => {
+    toastedRef.current = false;
+    setProject((p) => (p ? { ...p, status: "generating" } : p));
+    startPolling();
+  };
+
+  const handleReverted = (updatedProject) => {
+    setProject(updatedProject);
+    setVersionsRefreshKey((k) => k + 1);
   };
 
   const copy = async (text, label) => {
@@ -149,6 +187,8 @@ export const Builder = () => {
   if (!project) return null;
 
   const previewWidth = viewport === "mobile" ? 390 : "100%";
+  const previewHeight = "calc(100vh - 220px)";
+  const compareMode = Boolean(compareVersionId);
 
   return (
     <div className="min-h-screen">
@@ -175,6 +215,15 @@ export const Builder = () => {
               </div>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
+              <VersionControls
+                projectId={id}
+                currentVersionId={project.current_version_id}
+                onReverted={handleReverted}
+                compareVersionId={compareVersionId}
+                onCompareToggle={setCompareVersionId}
+                refreshKey={versionsRefreshKey}
+                disabled={isGenerating}
+              />
               <div className="flex items-center rounded-full border border-white/10 p-0.5">
                 <button
                   data-testid="viewport-desktop"
@@ -192,6 +241,14 @@ export const Builder = () => {
                 </button>
               </div>
               <Button
+                data-testid="edit-with-ai-btn"
+                onClick={() => setEditOpen(true)}
+                disabled={isGenerating || hasFailed || !project.html}
+                className="rounded-full bg-gradient-to-r from-blue-600 to-purple-600 hover:shadow-[0_0_25px_rgba(139,92,246,0.4)] text-white"
+              >
+                <Wand2 className="w-4 h-4 mr-2" /> Edit with AI
+              </Button>
+              <Button
                 data-testid="download-html-btn"
                 variant="outline"
                 disabled={isGenerating || !project.html}
@@ -207,19 +264,20 @@ export const Builder = () => {
             {/* Left: prompt + code */}
             <div className="glass rounded-2xl p-4 flex flex-col gap-3 h-fit lg:h-[calc(100vh-140px)] lg:sticky lg:top-24">
               <div className="text-xs font-semibold tracking-[0.2em] uppercase text-muted-foreground">
-                Prompt
+                Original Prompt
               </div>
               <Textarea
                 data-testid="builder-prompt"
                 value={prompt}
                 onChange={(e) => setPrompt(e.target.value)}
-                className="min-h-[100px] font-mono text-xs resize-none"
+                className="min-h-[90px] font-mono text-xs resize-none"
               />
               <Button
                 data-testid="regenerate-btn"
                 onClick={handleRegenerate}
                 disabled={regenerating || isGenerating}
-                className="rounded-full bg-gradient-to-r from-blue-600 to-purple-600 text-white"
+                variant="outline"
+                className="rounded-full"
               >
                 {regenerating || isGenerating ? (
                   <>
@@ -227,7 +285,7 @@ export const Builder = () => {
                   </>
                 ) : (
                   <>
-                    <RefreshCcw className="w-4 h-4 mr-2" /> Regenerate
+                    <RefreshCcw className="w-4 h-4 mr-2" /> Regenerate from scratch
                   </>
                 )}
               </Button>
@@ -280,13 +338,15 @@ export const Builder = () => {
                 <div className="w-3 h-3 rounded-full bg-green-500/70" />
                 <div className="ml-4 text-xs text-muted-foreground font-mono truncate">
                   preview · {project.name}
+                  {compareMode && " · Before / After"}
                 </div>
               </div>
 
               {isGenerating ? (
                 <div
                   data-testid="preview-loading"
-                  className="rounded-xl border border-white/10 flex flex-col items-center justify-center gap-4 h-[calc(100vh-220px)] relative overflow-hidden"
+                  className="rounded-xl border border-white/10 flex flex-col items-center justify-center gap-4 relative overflow-hidden"
+                  style={{ height: previewHeight }}
                 >
                   <div className="orb bg-purple-600" style={{ width: 300, height: 300, top: -60, right: -80 }} />
                   <div className="orb bg-blue-500" style={{ width: 300, height: 300, bottom: -80, left: -60 }} />
@@ -295,9 +355,9 @@ export const Builder = () => {
                       <Sparkles className="w-6 h-6 text-purple-400 animate-pulse" />
                     </div>
                     <div>
-                      <div className="font-medium mb-1">AI is building your site…</div>
+                      <div className="font-medium mb-1">AI is working on your site…</div>
                       <div className="text-sm text-muted-foreground max-w-sm">
-                        This usually takes 30–90 seconds. We're designing layout, writing content, and generating code.
+                        This usually takes 30–90 seconds.
                       </div>
                     </div>
                     <Loader2 className="w-5 h-5 animate-spin text-purple-500" />
@@ -306,7 +366,8 @@ export const Builder = () => {
               ) : hasFailed ? (
                 <div
                   data-testid="preview-failed"
-                  className="rounded-xl border border-red-500/30 bg-red-500/5 flex flex-col items-center justify-center gap-3 h-[calc(100vh-220px)] p-6 text-center"
+                  className="rounded-xl border border-red-500/30 bg-red-500/5 flex flex-col items-center justify-center gap-3 p-6 text-center"
+                  style={{ height: previewHeight }}
                 >
                   <AlertTriangle className="w-8 h-8 text-red-400" />
                   <div className="font-medium">Generation failed</div>
@@ -321,14 +382,46 @@ export const Builder = () => {
                     <RefreshCcw className="w-4 h-4 mr-2" /> Retry
                   </Button>
                 </div>
+              ) : compareMode ? (
+                <div
+                  data-testid="compare-view"
+                  className="grid grid-cols-1 md:grid-cols-2 gap-3"
+                >
+                  <div className="bg-white rounded-xl overflow-hidden border border-white/10">
+                    <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-muted-foreground bg-zinc-950/40">
+                      Before
+                    </div>
+                    <iframe
+                      data-testid="compare-iframe-before"
+                      title="Before"
+                      srcDoc={compareHtml}
+                      className="w-full bg-white"
+                      style={{ height: previewHeight }}
+                      sandbox="allow-scripts allow-same-origin"
+                    />
+                  </div>
+                  <div className="bg-white rounded-xl overflow-hidden border border-purple-500/30">
+                    <div className="px-3 py-1.5 text-[11px] font-semibold uppercase tracking-widest text-purple-300 bg-purple-500/10">
+                      After (current)
+                    </div>
+                    <iframe
+                      data-testid="compare-iframe-after"
+                      title="After"
+                      srcDoc={fullHtml}
+                      className="w-full bg-white"
+                      style={{ height: previewHeight }}
+                      sandbox="allow-scripts allow-same-origin"
+                    />
+                  </div>
+                </div>
               ) : (
                 <div className="bg-white rounded-xl overflow-hidden border border-white/10 flex justify-center">
                   <iframe
                     data-testid="preview-iframe"
                     title="Preview"
                     srcDoc={fullHtml}
-                    className="w-full h-[calc(100vh-220px)] bg-white transition-all"
-                    style={{ maxWidth: previewWidth }}
+                    className="w-full bg-white transition-all"
+                    style={{ maxWidth: previewWidth, height: previewHeight }}
                     sandbox="allow-scripts allow-same-origin"
                   />
                 </div>
@@ -337,6 +430,13 @@ export const Builder = () => {
           </div>
         </div>
       </div>
+
+      <EditWithAIDialog
+        projectId={id}
+        open={editOpen}
+        onOpenChange={setEditOpen}
+        onEditStarted={handleEditStarted}
+      />
     </div>
   );
 };

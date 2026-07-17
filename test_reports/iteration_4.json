@@ -1,0 +1,46 @@
+{
+  "summary": "Full regression + AI Editor testing. Backend: 32/32 pytest tests passed in 3:21 — all v1 endpoints (auth guards, generate, list, get, delete, logout) still work AND all new AI Editor endpoints work end-to-end with real GPT-5.2 (POST /edit returns immediately with status='generating', background LLM task ran ~90s and returned valid JSON, edit preserved home/about/services/contact and appended a real pricing section; POST /revert non-destructive; GET /versions returns list-view stripped of html/css/js; GET /versions/{id} returns full content; 409 on concurrent edit; 404s for non-existent project/version). Frontend: 13/13 UI flows verified via Playwright on the preview domain — Builder loads with existing project, Edit-with-AI button enabled (disabled when !project.html per code), dialog opens with exactly 11 suggestion chips, chip fills prompt, History sheet lists both versions, Revert button reverts, Undo/Redo work correctly, Before/After split view shows two iframes with different content (before has no pricing, after has pricing), mobile viewport (390x844) is usable.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "EditWithAIDialog on mobile (390x844)",
+        "issues": [
+          "Dialog backdrop opacity is relatively light — underlying Builder header/toolbar/tabs remain faintly visible behind the modal on mobile, which is a bit distracting though not blocking. Consider bumping backdrop opacity (bg-black/70 or so) on Dialog overlay for stronger focus."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_knowledge_nexus_backend.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py _run_edit (lines 317-373): concurrent-edit guard exists (409 in edit_project) but _run_generation has no such guard — a client could POST /projects/generate a second time on a project that's already generating. Consider adding the same 409 check to generate_project for consistency.",
+    "server.py revert_project (line 478): does NOT append a new version doc for the revert action; it only mutates the project row. Spec says version.action can be 'revert' — currently no 'revert' entries are ever created in project_versions. If the UX intends revert to be its own historical entry (rather than just a pointer move), this is missing. Currently working as: revert = pointer-only, non-destructive — which is fine and matches the tests, just calling out the divergence from the docstring listing 'revert' as a version action.",
+    "server.py _save_version (line 248): version snapshot stores full html/css/js in project_versions. For large sites with many edits, project_versions grows unbounded. Consider a per-project retention cap (e.g., keep last 30 versions) or dedupe by hashing.",
+    "Builder.jsx polling (line 60-81): 2.5s interval with no exponential backoff and no max attempts — if backend never transitions status, the tab polls forever. Add a hard timeout (e.g., 5 min) that flips to 'timed out — retry' state.",
+    "server.py line 411/441: asyncio.create_task fire-and-forget for LLM work — on worker restart/hot-reload, in-flight generations/edits are orphaned and projects stay stuck at status='generating'. Add a startup sweeper that marks stale 'generating' docs (updated_at > N minutes ago) as 'failed'.",
+    "VersionControls.jsx compare-toggle default picks versions[currentIdx - 1] or versions[0] — when only one version exists the button is correctly disabled (versions.length < 2). When on first version and clicking Compare with 2+ versions, it falls back to versions[0] which IS the current — resulting in identical Before/After. Consider defaulting to the previous version relative to current, or the last non-current version.",
+    "EditWithAIDialog: no client-side length guardrails on the prompt (empty is caught but there is no max-length). Long paste could bloat the LLM input. Consider adding a maxlength (e.g., 2000 chars)."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_knowledge_nexus_backend.py"
+  ],
+  "success_rate": {
+    "backend": "100% (32/32 pytest tests passed, incl. real GPT-5.2 generate + edit + revert non-destructive)",
+    "frontend": "100% (13/13 UI flows verified end-to-end — Edit dialog, chips, History, Undo/Redo, Before/After compare, mobile)"
+  },
+  "test_credentials": "Backend: pytest conftest auto-provisions a fresh test user + session per xdist worker via MongoDB (test_database). Frontend Playwright run used session_token=test_session_fe_1784283885177 (user test-user-fe-1784283885177) with a pre-seeded project (proj_091544a33d26) containing 2 versions (generate ver_a65ce036d5a4 + edit ver_fe928de6e612 with a pricing section) so Undo/Redo/Compare could be verified without triggering a second real LLM edit. All seed data cleaned up after the run.",
+  "seed_data_creation": "Pre-seeded 1 project + 2 versions in MongoDB for frontend Undo/Redo/Compare/History tests (deleted after run). Backend pytest fixtures auto-clean their own data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "AI Editor is fully working. Backend contract: POST /api/projects/{id}/edit is auth-gated, 404 for missing project, 409 if status=='generating', otherwise returns {project_id,status:'generating'} in <1s and kicks off async LLM edit that appends an 'edit' version and advances current_version_id when done. GET /api/projects/{id}/versions returns ascending list (list view strips html/css/js). GET /api/projects/{id}/versions/{vid} returns full snapshot. POST /api/projects/{id}/revert is non-destructive (pointer-only, does NOT delete newer versions and does NOT create a 'revert' version entry). Frontend Builder uses 2.5s polling for both generate and edit; EditWithAIDialog has exactly 11 suggestion chips; VersionControls implements Undo/Redo/History Sheet + Compare toggle rendering two side-by-side iframes with the previous version as 'Before'. Concurrent LLM budget = 1 on Basic plan — do not parallelize generate+edit across users when testing. If you re-run backend tests, expect ~3-4 min wall clock for the class that does real generate+edit."
+}
