@@ -1,0 +1,3 @@
+Wombat Rocket Protocol notes.
+The Wombat Rocket uses tritium fuel and a magnetic sail.
+Speed: 42000 km/h. Payload: 3 tons.

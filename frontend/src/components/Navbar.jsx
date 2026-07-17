@@ -1,5 +1,5 @@
 import { Link, useNavigate } from "react-router-dom";
-import { Sparkles, LogOut, LayoutDashboard } from "lucide-react";
+import { Sparkles, LogOut, LayoutDashboard, MessageSquare, ImageIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import {
@@ -47,7 +47,25 @@ export const Navbar = () => {
                 className="rounded-full hidden sm:inline-flex"
               >
                 <LayoutDashboard className="w-4 h-4 mr-2" />
-                Dashboard
+                Websites
+              </Button>
+              <Button
+                data-testid="nav-chat-btn"
+                variant="ghost"
+                onClick={() => navigate("/chat")}
+                className="rounded-full hidden sm:inline-flex"
+              >
+                <MessageSquare className="w-4 h-4 mr-2" />
+                Chat
+              </Button>
+              <Button
+                data-testid="nav-images-btn"
+                variant="ghost"
+                onClick={() => navigate("/images")}
+                className="rounded-full hidden sm:inline-flex"
+              >
+                <ImageIcon className="w-4 h-4 mr-2" />
+                Images
               </Button>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -65,7 +83,13 @@ export const Navbar = () => {
                   </DropdownMenuLabel>
                   <DropdownMenuSeparator />
                   <DropdownMenuItem data-testid="menu-dashboard" onClick={() => navigate("/dashboard")}>
-                    <LayoutDashboard className="w-4 h-4 mr-2" /> Dashboard
+                    <LayoutDashboard className="w-4 h-4 mr-2" /> Websites
+                  </DropdownMenuItem>
+                  <DropdownMenuItem data-testid="menu-chat" onClick={() => navigate("/chat")}>
+                    <MessageSquare className="w-4 h-4 mr-2" /> Chat
+                  </DropdownMenuItem>
+                  <DropdownMenuItem data-testid="menu-images" onClick={() => navigate("/images")}>
+                    <ImageIcon className="w-4 h-4 mr-2" /> Images
                   </DropdownMenuItem>
                   <DropdownMenuItem data-testid="menu-logout" onClick={logout}>
                     <LogOut className="w-4 h-4 mr-2" /> Log out
@@ -74,13 +98,23 @@ export const Navbar = () => {
               </DropdownMenu>
             </>
           ) : (
-            <Button
-              data-testid="nav-login-btn"
-              onClick={googleLogin}
-              className="rounded-full bg-gradient-to-r from-blue-600 to-purple-600 hover:shadow-[0_0_25px_rgba(139,92,246,0.4)] text-white px-5"
-            >
-              Sign in with Google
-            </Button>
+            <>
+              <Button
+                data-testid="nav-email-login-btn"
+                variant="ghost"
+                onClick={() => navigate("/login")}
+                className="rounded-full hidden sm:inline-flex"
+              >
+                Log in
+              </Button>
+              <Button
+                data-testid="nav-login-btn"
+                onClick={googleLogin}
+                className="rounded-full bg-gradient-to-r from-blue-600 to-purple-600 hover:shadow-[0_0_25px_rgba(139,92,246,0.4)] text-white px-5"
+              >
+                Sign in with Google
+              </Button>
+            </>
           )}
         </div>
       </div>

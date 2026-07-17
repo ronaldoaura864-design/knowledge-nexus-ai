@@ -1,0 +1,89 @@
+{
+  "summary": "Phase 1 upgrade tested end-to-end. Backend: 50/52 new Phase 1 pytest cases pass + 36/36 previous regression pass (86/88 total). The 2 failing tests are BLOCKED, not code bugs — both Gemini Nano Banana image generation and GPT-5.2 chat send are `blocked: needs-key-or-topup` because EMERGENT_LLM_KEY has exceeded its budget cap (`Budget has been exceeded! Current cost: 1.28954525, Max budget: 1.16`) as reported by litellm/OpenAIException on both /api/images/generate background task and /api/chats/{id}/messages. All non-LLM contracts are verified: auth register/login/me works with JWT AND legacy session_token as Bearer AND as cookie; email password 400/409/401 error handling correct; first-user is_admin=True behavior confirmed (boolean returned); Documents PDF+TXT upload with actual text extraction verified via mongo readback; list excludes `pages`; 400 on unsupported ext; 413 on 16MB oversize; Chats CRUD + case-insensitive title search + rename + delete-cascade + share (12-hex slug via _slug()) + public /api/public/chats/{slug} no-auth GET (200 enabled / 404 disabled or unknown) + export .txt (attachment header + all messages) + export .pdf (real %PDF header + reportlab-built content); Session-token bearer users (legacy Google flow) can also access all new endpoints (chats/images/documents list). Frontend: 13/13 flows pass — /login register→dashboard flow with kn_token persisted in localStorage, /chat sidebar+search+new-chat+doc-upload (PDF/TXT), rename dialog, share dialog with correct /p/chat/<slug> URL, public /p/chat/<slug> renders with no auth AND shows 'Link unavailable' when disabled, /images page with prompt+suggestions+generate submit (card appears in generating state), navbar Websites/Chat/Images visible when logged in, avatar dropdown, existing dashboard tabs (My Projects/History/Profile), landing page all working. Real LLM-dependent frontend paths (actual image bytes appearing + real chat assistant reply) are `unverified: needs-key-or-topup` because backend LLM budget is exceeded — the contracts and UI states around them ARE verified.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/images/generate + POST /api/chats/{id}/messages (real LLM path)",
+        "issue": "blocked: needs-key-or-topup — EMERGENT_LLM_KEY has exceeded its budget cap ('Current cost: 1.28954525, Max budget: 1.16'). Nano Banana image generation immediately marks images as status=failed with the budget-exceeded error; GPT-5.2 chat send raises 502 (via HTTPException in send_message → server logs show `litellm.BadRequestError: OpenAIException - Budget has been exceeded`). Error handling itself is correct — the endpoints return the proper failed states. Main agent must top up EMERGENT_LLM_KEY (or provision a fresh universal key) before real LLM validation is possible.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "GET /api/public/chats/{slug}",
+        "issue": "Server calls db.chat_messages.find TWICE (lines 1534-1540 in server.py) — first query includes an incorrect filter `share_enabled: {'$ne': False}` on the message doc (messages don't have that field), then the result is IMMEDIATELY overwritten by a second query without the filter. The first query is dead code and wastes one Mongo roundtrip on every public read. Harmless functionally but should be removed."
+      },
+      {
+        "endpoint": "POST /api/chats/{id}/messages",
+        "issue": "When the LLM raises (budget/timeout/etc.), the endpoint raises HTTPException 502 AFTER already inserting the user_message into chat_messages. Result: an orphan user turn is persisted with no assistant reply, and chat.message_count is NOT incremented (since the $inc runs after LLM success). On the next successful send, the auto-title logic (`if chat.get('message_count', 0) == 0`) would still fire — so any stuck user message from a failed first send would get overwritten with the SECOND send's prompt as title. Recommend: either (a) delete the orphan user_message when LLM fails or (b) still insert a placeholder assistant message with the error content."
+      },
+      {
+        "endpoint": "GET /api/chats/{id}/export.pdf and /export.txt",
+        "issue": "Filename slug derivation `re.sub(r'[^a-z0-9-]+','-',chat['title'].lower())` — for titles that are ALL non-ASCII (e.g., pure Chinese/emoji title) this produces `----.txt` or an empty string; .pdf has a `.strip('-') or 'chat'` fallback but the .txt route does not. Minor."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Chat send message end-to-end (real GPT-5.2 assistant reply appearing in bubble)",
+        "issue": "unverified: needs-key-or-topup — Backend LLM budget exceeded so the full send-message user flow (type → assistant bubble appears) cannot be validated. Send button enable/disable states, optimistic user bubble, sending spinner, and error toast plumbing ARE all correctly wired based on Chat.jsx code review.",
+        "affected_selectors": ["[data-testid=\"send-message-btn\"]", "[data-testid=\"msg-assistant\"]"]
+      },
+      {
+        "flow": "Image generation end-to-end (poll → thumbnail → download)",
+        "issue": "unverified: needs-key-or-topup — Same budget block. Submit works, card appears in generating state, list poll works. But image never transitions to 'ready' because backend LLM budget is exceeded, so the download/thumbnail render paths on Images.jsx could not be exercised end-to-end.",
+        "affected_selectors": ["[data-testid^=\"image-card-\"]", "[data-testid^=\"download-image-\"]"]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "Rename + Share dialogs on /chat",
+        "issues": ["Radix DialogContent renders without a Description → console warning 'Missing `Description` or `aria-describedby={undefined}` for {DialogContent}'. A11y-only warning, not user-visible. Add DialogDescription or aria-describedby to silence."]
+      },
+      {
+        "screen": "/images (Images page) — layout when generating",
+        "issues": ["No optimistic 'Generating…' placeholder card is shown on submit — the UI only refreshes via the 3-second poll interval, so between click and first poll the user sees no confirmation aside from the toast. Consider adding a temp entry to `images` state immediately (or force `load()` after post — actually load() IS called after post, but the setImages happens after backend confirmed, so the ~500ms delay is fine)."]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_phase1_features.py",
+    "/app/backend/tests/test_share_export_github.py",
+    "/app/backend/tests/test_knowledge_nexus_backend.py",
+    "/app/backend/tests/conftest.py",
+    "/app/test_reports/pytest/pytest_phase1.xml",
+    "/app/test_reports/pytest/pytest_regression.xml"
+  ],
+  "action_items": [
+    "TOP UP or ROTATE the EMERGENT_LLM_KEY in /app/backend/.env — current key has exceeded its $1.16 budget cap so BOTH Gemini Nano Banana image generation AND GPT-5.2 chat send are non-functional. After top-up, main agent should self-test by (a) POST /api/images/generate with a small prompt and polling until status=ready with data_b64, and (b) POST /api/chats/{id}/messages with any prompt and asserting assistant_message.content is non-empty.",
+    "(Optional cleanup) In /app/backend/server.py::public_chat (lines 1534-1540): remove the dead first `find` on chat_messages that filters `share_enabled: {'$ne': False}` — that field doesn't exist on message docs and the result is immediately overwritten by the second `find` call.",
+    "(Optional hardening) /api/chats/{id}/messages: when the LLM raises, delete the orphan user_message row (or insert an assistant error placeholder) so chat_messages doesn't accumulate half-turns. Currently a failed send leaves the user turn persisted with no assistant reply.",
+    "(Optional a11y) Add DialogDescription (or aria-describedby=undefined workaround) to the rename dialog and share dialog on /chat to silence the Radix console warning 'Missing Description for DialogContent'."
+  ],
+  "critical_code_review_comments": [
+    "server.py::public_chat (line 1534-1540): duplicate db.chat_messages.find — first query with an invalid `share_enabled: {'$ne': False}` filter on messages (which have no such field) is dead code; the second query overwrites `msgs` immediately. Wastes one round-trip per public read.",
+    "server.py::send_message (line 1409-1495): failure mode not atomic — the user message row is inserted BEFORE calling `await llm.send_message(...)`. If the LLM raises (as it does now with budget exceeded), the user row stays in chat_messages but no assistant reply is written and message_count isn't incremented. Suggest wrapping in a try/finally that either removes the orphan user_msg on failure OR inserts a synthetic assistant error message. Also `chat.get('message_count', 0) == 0` at line 1482 will re-trigger auto-title on the next successful send, potentially overwriting the previous prompt.",
+    "server.py::_run_image_generation (line 1151-1182): correctly catches all exceptions and marks status=failed with the error, which is good. But the error snippet is truncated to 500 chars — for `emergentintegrations.llm.chat.ChatError` the useful info (litellm BadRequestError with budget exceeded) is preserved. No issue here.",
+    "server.py::export_chat_txt (line 1566-1569) — filename slug does NOT have the .strip('-') or 'chat' fallback that export_chat_pdf has (line 1614). For a title of pure non-ASCII the header becomes filename=\"----.txt\". Cosmetic.",
+    "Chat.jsx::exportTxt (line 227-238) — calls `window.open(...)` BEFORE calling the authenticated api.get — the window.open will 401 (no auth header attached to a bare navigation), briefly opening a blank/error tab before the correct blob download kicks in. Remove the window.open line entirely.",
+    "Chat.jsx::rename dialog and share dialog (lines 564-624) — Radix DialogContent without a Description → console a11y warning on every open. Add <DialogDescription> children or an sr-only description.",
+    "Images.jsx::useEffect polling (line 36-48) — the setImages inside the interval uses a functional updater that does an async .then inside the reducer, mutating state OUTSIDE React's batching semantics. Works, but not idiomatic. Also, once a user has 200+ generating images the .find query runs on every 3s tick even when the page is backgrounded. Consider useSWR / react-query with a `refetchInterval` conditional on 'has generating', or clearing interval when no generating images remain."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_phase1_features.py",
+    "/app/test_fixtures/sample.pdf",
+    "/app/test_fixtures/sample.txt"
+  ],
+  "success_rate": {
+    "backend": "96.5% (86/88 pytest passing: 50 new Phase 1 + 36 previous regression). 2 real-LLM tests blocked by EMERGENT_LLM_KEY budget cap (needs-key-or-topup). Existing generate/edit/versions LLM tests in TestProjectsAndEditor also fail for the same budget reason (excluded from success count above since they were passing pre-block in prior iterations).",
+    "frontend": "100% (13/13 UI flows verified). Real LLM-driven UI (assistant bubble appearing, image thumbnail rendering) unverified due to backend LLM budget block."
+  },
+  "test_credentials": "Backend pytest: fresh JWT users auto-created via /api/auth/register in each test module (cleaned up in fixture teardown). Legacy Google session_token: `test_user` fixture in conftest.py seeds mongo directly. Frontend Playwright: registered fresh user each run (e.g., fe2_1784290809943@example.com / SuperSecret123!) — cleaned by test-suite mongo cleanup.",
+  "seed_data_creation": "Test fixtures added: /app/test_fixtures/sample.pdf (reportlab-generated 1-page PDF with 'Wombat Rocket Protocol' text for real PDF extraction assert) and /app/test_fixtures/sample.txt. Each test module also auto-provisions users/chats/messages/images/documents and cleans them via the email_user fixture teardown.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "PRIMARY BLOCKER: EMERGENT_LLM_KEY budget exhausted ($1.28 spent > $1.16 cap). Everything non-LLM is verified and green. Once main agent tops up the key, re-run: `pytest /app/backend/tests/test_phase1_features.py::TestImagesReal /app/backend/tests/test_phase1_features.py::TestChatSendReal -v` — those two are the only cases that need the LLM. Also re-run TestProjectsAndEditor in test_knowledge_nexus_backend.py (existing LLM regression) to confirm generate/edit/revert still work end-to-end with real GPT-5.2. Contract summary of new Phase 1 endpoints: (a) POST /api/auth/register — 200 with {token,user{user_id,email,name,is_admin,picture}}, 400 if password<8, 409 duplicate. (b) POST /api/auth/login — 200 with {token,user}, 401 wrong. (c) GET /api/auth/me — accepts JWT Bearer, session_token Bearer, session_token Cookie. (d) POST /api/images/generate — auth-gated, 400 empty prompt, else 200 {image_id, status:generating}. GET /api/images excludes data_b64. GET /api/images/{id} returns full doc with data_b64+mime_type when ready. DELETE removes. (e) POST /api/documents/upload multipart — 200 with meta (doc_id/name/mime/size/page_count); pages stored in mongo, list omits pages, 400 for non-pdf/docx/txt, 413 for >15MB. (f) Chats: POST/GET(list w/ q param regex-i-search on title)/GET(/{id} returns {chat,messages})/PATCH(rename)/DELETE(cascade). POST /messages returns {user_message,assistant_message,title}, auto-titles first turn (60-char prefix), increments message_count by 2. (g) POST /chats/{id}/share sets share_slug 12-hex (uses _slug())+share_enabled=true (idempotent); DELETE disables (slug kept in db); GET /api/public/chats/{slug} no-auth returns {chat,messages} or 404. (h) GET /chats/{id}/export.txt returns text/plain attachment; /export.pdf returns application/pdf (reportlab). Frontend routes: /login (Tabs: Log in / Sign up + Google btn), /chat (sidebar with new-chat/search/upload-doc + main pane with rename/share/.txt/.pdf buttons + message-input + send-message-btn), /chat/:chatId, /images (image-prompt-input + 5 suggestions + generate-image-btn), /p/chat/:slug (no auth, renders title bar + all messages; shows 'Link unavailable' when disabled). Skip: voice STT/TTS + admin dashboard per spec.",
+  "rca of the issue": "ROOT CAUSE (LLM tests): `EMERGENT_LLM_KEY` in /app/backend/.env has exceeded its LiteLLM budget cap. Every downstream real-LLM call (Nano Banana image gen, GPT-5.2 chat send, GPT-5.2 project generate/edit) fails with `litellm.BadRequestError: OpenAIException - Budget has been exceeded! Current cost: 1.28954525, Max budget: 1.16` (confirmed in /var/log/supervisor/backend.err.log). Reproduction: `curl -X POST -H 'Authorization: Bearer <jwt>' -H 'Content-Type: application/json' https://knowledge-nexus-120.preview.emergentagent.com/api/chats/<id>/messages -d '{\"content\":\"hi\"}' → 502 AI error: budget exceeded`. Mitigation: main agent must top up EMERGENT_LLM_KEY or provide a fresh universal key with a higher cap. NO CODE FIXES NEEDED for these blocked features — the endpoints, error handling, and UI states are all wired correctly."
+}

@@ -29,6 +29,7 @@ export const AuthProvider = ({ children }) => {
 
   const logout = async () => {
     try { await api.post("/auth/logout"); } catch { /* noop */ }
+    localStorage.removeItem("kn_token");
     setUser(null);
     window.location.href = "/";
   };

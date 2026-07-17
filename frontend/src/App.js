@@ -7,6 +7,10 @@ import { Dashboard } from "@/pages/Dashboard";
 import { Builder } from "@/pages/Builder";
 import { AuthCallback } from "@/pages/AuthCallback";
 import { PublicPreview } from "@/pages/PublicPreview";
+import { Login } from "@/pages/Login";
+import { Chat } from "@/pages/Chat";
+import { Images } from "@/pages/Images";
+import { PublicChat } from "@/pages/PublicChat";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { Toaster } from "sonner";
 
@@ -29,12 +33,38 @@ const AppRouter = () => {
   return (
     <Routes>
       <Route path="/" element={<Landing />} />
+      <Route path="/login" element={<Login />} />
       <Route path="/p/:slug" element={<PublicPreview />} />
+      <Route path="/p/chat/:slug" element={<PublicChat />} />
       <Route
         path="/dashboard"
         element={
           <ProtectedRoute>
             <Dashboard />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/chat"
+        element={
+          <ProtectedRoute>
+            <Chat />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/chat/:chatId"
+        element={
+          <ProtectedRoute>
+            <Chat />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/images"
+        element={
+          <ProtectedRoute>
+            <Images />
           </ProtectedRoute>
         }
       />

@@ -1,5 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, Header, Depends
-from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse
+from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, Header, Depends, UploadFile, File, Form
+from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -13,12 +13,14 @@ import zipfile
 import secrets
 import uuid
 from pathlib import Path
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, List
 from datetime import datetime, timezone, timedelta
 import httpx
+import bcrypt
+import jwt as pyjwt
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage
+from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -31,6 +33,9 @@ db = client[os.environ["DB_NAME"]]
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+JWT_SECRET = os.environ.get("JWT_SECRET", "insecure-dev-secret")
+JWT_ALGO = "HS256"
+JWT_EXP_DAYS = 30
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -72,6 +77,34 @@ class GithubPushRequest(BaseModel):
     commit_message: Optional[str] = "Update from Knowledge-Nexus AI"
 
 
+class RegisterRequest(BaseModel):
+    email: EmailStr
+    password: str
+    name: Optional[str] = None
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class ImageGenRequest(BaseModel):
+    prompt: str
+
+
+class ChatCreateRequest(BaseModel):
+    title: Optional[str] = None
+
+
+class ChatUpdateRequest(BaseModel):
+    title: str
+
+
+class SendMessageRequest(BaseModel):
+    content: str
+    doc_ids: Optional[List[str]] = None
+
+
 class Project(BaseModel):
     project_id: str
     user_id: str
@@ -86,6 +119,23 @@ class Project(BaseModel):
 
 
 # ============ Auth helpers ============
+def _make_jwt(user_id: str) -> str:
+    payload = {
+        "sub": user_id,
+        "iat": datetime.now(timezone.utc),
+        "exp": datetime.now(timezone.utc) + timedelta(days=JWT_EXP_DAYS),
+    }
+    return pyjwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def _decode_jwt(token: str) -> Optional[str]:
+    try:
+        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload.get("sub")
+    except Exception:
+        return None
+
+
 async def get_current_user(
     session_token: Optional[str] = Cookie(default=None),
     authorization: Optional[str] = Header(default=None),
@@ -96,22 +146,28 @@ async def get_current_user(
     if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
+    # 1) Try session token (Google flow / seed sessions)
     sess = await db.user_sessions.find_one({"session_token": token}, {"_id": 0})
-    if not sess:
+    user_id: Optional[str] = None
+    if sess:
+        expires_at = sess.get("expires_at")
+        if isinstance(expires_at, str):
+            expires_at = datetime.fromisoformat(expires_at)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at < datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Session expired")
+        user_id = sess["user_id"]
+    else:
+        # 2) Try JWT (email auth)
+        user_id = _decode_jwt(token)
+    if not user_id:
         raise HTTPException(status_code=401, detail="Invalid session")
 
-    expires_at = sess.get("expires_at")
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
-    if expires_at < datetime.now(timezone.utc):
-        raise HTTPException(status_code=401, detail="Session expired")
-
-    user_doc = await db.users.find_one({"user_id": sess["user_id"]}, {"_id": 0})
+    user_doc = await db.users.find_one({"user_id": user_id}, {"_id": 0, "password_hash": 0})
     if not user_doc:
         raise HTTPException(status_code=401, detail="User not found")
-    return User(**user_doc)
+    return User(**{k: v for k, v in user_doc.items() if k in User.model_fields})
 
 
 # ============ Routes ============
@@ -1027,6 +1083,540 @@ async def push_to_github(
         {"$set": {"github_repo": f"{username}/{repo_name}", "github_repo_url": repo_url, "updated_at": datetime.now(timezone.utc).isoformat()}},
     )
     return {"ok": True, "repo": f"{username}/{repo_name}", "html_url": repo_url, "branch": default_branch}
+
+
+# ============ Email + Password Auth ============
+def _hash_password(pw: str) -> str:
+    return bcrypt.hashpw(pw.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+
+
+def _verify_password(pw: str, hashed: str) -> bool:
+    try:
+        return bcrypt.checkpw(pw.encode("utf-8"), hashed.encode("utf-8"))
+    except Exception:
+        return False
+
+
+@api_router.post("/auth/register")
+async def register(payload: RegisterRequest):
+    email = payload.email.lower().strip()
+    if len(payload.password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    existing = await db.users.find_one({"email": email})
+    if existing:
+        raise HTTPException(status_code=409, detail="Email already registered")
+    total = await db.users.count_documents({})
+    user_id = f"user_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "user_id": user_id,
+        "email": email,
+        "name": payload.name or email.split("@")[0],
+        "picture": "",
+        "password_hash": _hash_password(payload.password),
+        "auth_provider": "email",
+        "is_admin": total == 0,
+        "created_at": now,
+    }
+    await db.users.insert_one(doc)
+    token = _make_jwt(user_id)
+    return {
+        "token": token,
+        "user": {"user_id": user_id, "email": email, "name": doc["name"], "picture": "", "is_admin": doc["is_admin"]},
+    }
+
+
+@api_router.post("/auth/login")
+async def login(payload: LoginRequest):
+    email = payload.email.lower().strip()
+    doc = await db.users.find_one({"email": email})
+    if not doc or not doc.get("password_hash"):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not _verify_password(payload.password, doc["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    token = _make_jwt(doc["user_id"])
+    return {
+        "token": token,
+        "user": {
+            "user_id": doc["user_id"],
+            "email": doc["email"],
+            "name": doc.get("name", ""),
+            "picture": doc.get("picture", ""),
+            "is_admin": doc.get("is_admin", False),
+        },
+    }
+
+
+# ============ AI Image Generator (Gemini Nano Banana) ============
+async def _run_image_generation(image_id: str, user_id: str, prompt: str):
+    try:
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"img_{uuid.uuid4().hex[:10]}",
+            system_message="You are a professional AI image generator. Produce a single high-quality image based on the prompt.",
+        )
+        chat.with_model("gemini", "gemini-3.1-flash-image-preview").with_params(modalities=["image", "text"])
+        text, images = await chat.send_message_multimodal_response(UserMessage(text=prompt))
+        if not images:
+            raise ValueError("Model returned no image")
+        img = images[0]
+        now = datetime.now(timezone.utc).isoformat()
+        await db.ai_images.update_one(
+            {"image_id": image_id, "user_id": user_id},
+            {
+                "$set": {
+                    "status": "ready",
+                    "mime_type": img.get("mime_type", "image/png"),
+                    "data_b64": img["data"],
+                    "caption": (text or "")[:400],
+                    "updated_at": now,
+                    "error": None,
+                }
+            },
+        )
+    except Exception as e:
+        logger.exception("Image generation failed")
+        await db.ai_images.update_one(
+            {"image_id": image_id, "user_id": user_id},
+            {"$set": {"status": "failed", "error": str(e)[:500], "updated_at": datetime.now(timezone.utc).isoformat()}},
+        )
+
+
+@api_router.post("/images/generate")
+async def generate_image(req: ImageGenRequest, user: User = Depends(get_current_user)):
+    if not EMERGENT_LLM_KEY:
+        raise HTTPException(status_code=500, detail="LLM key not configured")
+    if not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt required")
+    image_id = f"img_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    await db.ai_images.insert_one(
+        {
+            "image_id": image_id,
+            "user_id": user.user_id,
+            "prompt": req.prompt,
+            "status": "generating",
+            "data_b64": "",
+            "mime_type": "",
+            "caption": "",
+            "error": None,
+            "created_at": now,
+            "updated_at": now,
+        }
+    )
+    asyncio.create_task(_run_image_generation(image_id, user.user_id, req.prompt))
+    return {"image_id": image_id, "status": "generating"}
+
+
+@api_router.get("/images")
+async def list_images(user: User = Depends(get_current_user)):
+    cursor = db.ai_images.find(
+        {"user_id": user.user_id},
+        {"_id": 0, "data_b64": 0},
+    ).sort("created_at", -1)
+    return await cursor.to_list(200)
+
+
+@api_router.get("/images/{image_id}")
+async def get_image(image_id: str, user: User = Depends(get_current_user)):
+    doc = await db.ai_images.find_one({"image_id": image_id, "user_id": user.user_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return doc
+
+
+@api_router.delete("/images/{image_id}")
+async def delete_image(image_id: str, user: User = Depends(get_current_user)):
+    res = await db.ai_images.delete_one({"image_id": image_id, "user_id": user.user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Image not found")
+    return {"ok": True}
+
+
+# ============ Documents ============
+def _extract_text_pdf(data: bytes) -> tuple[List[str], int]:
+    import pypdf
+    reader = pypdf.PdfReader(io.BytesIO(data))
+    pages = []
+    for p in reader.pages:
+        try:
+            pages.append(p.extract_text() or "")
+        except Exception:
+            pages.append("")
+    return pages, len(pages)
+
+
+def _extract_text_docx(data: bytes) -> tuple[List[str], int]:
+    import docx
+    d = docx.Document(io.BytesIO(data))
+    text = "\n".join(p.text for p in d.paragraphs if p.text)
+    return [text], 1
+
+
+def _extract_text_txt(data: bytes) -> tuple[List[str], int]:
+    text = data.decode("utf-8", errors="replace")
+    return [text], 1
+
+
+MAX_DOC_SIZE = 15 * 1024 * 1024  # 15 MB
+
+
+@api_router.post("/documents/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
+):
+    data = await file.read()
+    if len(data) > MAX_DOC_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 15 MB)")
+    name = file.filename or "document"
+    ext = (name.rsplit(".", 1)[-1] or "").lower()
+    if ext == "pdf":
+        pages, count = _extract_text_pdf(data)
+        mime = "application/pdf"
+    elif ext == "docx":
+        pages, count = _extract_text_docx(data)
+        mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif ext == "txt":
+        pages, count = _extract_text_txt(data)
+        mime = "text/plain"
+    else:
+        raise HTTPException(status_code=400, detail="Only PDF, DOCX, TXT are supported")
+
+    doc_id = f"doc_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    await db.documents.insert_one(
+        {
+            "doc_id": doc_id,
+            "user_id": user.user_id,
+            "name": name,
+            "mime": mime,
+            "size": len(data),
+            "page_count": count,
+            "pages": pages,
+            "created_at": now,
+        }
+    )
+    return {"doc_id": doc_id, "name": name, "mime": mime, "size": len(data), "page_count": count}
+
+
+@api_router.get("/documents")
+async def list_documents(user: User = Depends(get_current_user)):
+    cursor = db.documents.find(
+        {"user_id": user.user_id},
+        {"_id": 0, "pages": 0},
+    ).sort("created_at", -1)
+    return await cursor.to_list(200)
+
+
+@api_router.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str, user: User = Depends(get_current_user)):
+    res = await db.documents.delete_one({"doc_id": doc_id, "user_id": user.user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"ok": True}
+
+
+# ============ Chats ============
+CHAT_SYSTEM_PROMPT = """You are a helpful, concise AI assistant. Format answers in Markdown when useful. If DOCUMENTS are provided, ground your answer in them and cite sources inline in the format [source: <doc_name>, page: <n>]. If the answer is not in the documents, say so."""
+
+
+def _build_docs_context(docs: List[dict], max_chars: int = 60000) -> str:
+    if not docs:
+        return ""
+    lines = ["--- DOCUMENTS ---"]
+    used = 0
+    for d in docs:
+        pages = d.get("pages", []) or []
+        header = f"\n### DOCUMENT: {d['name']} (pages: {d.get('page_count', len(pages))})\n"
+        if used + len(header) > max_chars:
+            break
+        lines.append(header)
+        used += len(header)
+        for i, p in enumerate(pages, 1):
+            block = f"\n[page {i}]\n{p}\n"
+            if used + len(block) > max_chars:
+                lines.append(f"\n[…truncated, {len(pages) - i + 1} pages omitted…]")
+                break
+            lines.append(block)
+            used += len(block)
+    lines.append("\n--- END DOCUMENTS ---")
+    return "".join(lines)
+
+
+@api_router.post("/chats")
+async def create_chat(payload: ChatCreateRequest, user: User = Depends(get_current_user)):
+    chat_id = f"chat_{uuid.uuid4().hex[:12]}"
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "chat_id": chat_id,
+        "user_id": user.user_id,
+        "title": (payload.title or "New chat")[:120],
+        "share_slug": None,
+        "share_enabled": False,
+        "created_at": now,
+        "updated_at": now,
+        "message_count": 0,
+    }
+    await db.chats.insert_one(doc)
+    doc.pop("_id", None)
+    return doc
+
+
+@api_router.get("/chats")
+async def list_chats(
+    q: Optional[str] = None,
+    user: User = Depends(get_current_user),
+):
+    filter_ = {"user_id": user.user_id}
+    if q:
+        filter_["title"] = {"$regex": re.escape(q), "$options": "i"}
+    cursor = db.chats.find(filter_, {"_id": 0}).sort("updated_at", -1)
+    return await cursor.to_list(200)
+
+
+@api_router.get("/chats/{chat_id}")
+async def get_chat(chat_id: str, user: User = Depends(get_current_user)):
+    chat = await db.chats.find_one({"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    msgs = await db.chat_messages.find(
+        {"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0}
+    ).sort("created_at", 1).to_list(500)
+    return {"chat": chat, "messages": msgs}
+
+
+@api_router.patch("/chats/{chat_id}")
+async def rename_chat(chat_id: str, payload: ChatUpdateRequest, user: User = Depends(get_current_user)):
+    res = await db.chats.update_one(
+        {"chat_id": chat_id, "user_id": user.user_id},
+        {"$set": {"title": payload.title[:120], "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return {"ok": True}
+
+
+@api_router.delete("/chats/{chat_id}")
+async def delete_chat(chat_id: str, user: User = Depends(get_current_user)):
+    res = await db.chats.delete_one({"chat_id": chat_id, "user_id": user.user_id})
+    if res.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    await db.chat_messages.delete_many({"chat_id": chat_id, "user_id": user.user_id})
+    return {"ok": True}
+
+
+@api_router.post("/chats/{chat_id}/messages")
+async def send_message(
+    chat_id: str, payload: SendMessageRequest, user: User = Depends(get_current_user)
+):
+    chat = await db.chats.find_one({"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    user_msg = {
+        "message_id": f"msg_{uuid.uuid4().hex[:12]}",
+        "chat_id": chat_id,
+        "user_id": user.user_id,
+        "role": "user",
+        "content": payload.content,
+        "doc_ids": payload.doc_ids or [],
+        "created_at": now,
+    }
+    await db.chat_messages.insert_one(user_msg)
+
+    # Load docs
+    docs: List[dict] = []
+    if payload.doc_ids:
+        cursor = db.documents.find(
+            {"user_id": user.user_id, "doc_id": {"$in": payload.doc_ids}}, {"_id": 0}
+        )
+        docs = await cursor.to_list(20)
+
+    # Build LLM chat with prior history
+    history = await db.chat_messages.find(
+        {"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0}
+    ).sort("created_at", 1).to_list(200)
+
+    session_id = f"chat_{chat_id}"
+    llm = LlmChat(
+        api_key=EMERGENT_LLM_KEY,
+        session_id=session_id,
+        system_message=CHAT_SYSTEM_PROMPT,
+    ).with_model("openai", "gpt-5.2")
+
+    # Compose one user message that includes prior turns + docs context
+    context_lines = []
+    if docs:
+        context_lines.append(_build_docs_context(docs))
+    if len(history) > 1:  # prior turns exist (excluding just-inserted user msg)
+        context_lines.append("\n--- PRIOR CONVERSATION ---")
+        for m in history[:-1][-12:]:
+            role = m["role"].upper()
+            context_lines.append(f"\n{role}: {m['content']}")
+        context_lines.append("\n--- END PRIOR CONVERSATION ---\n")
+    context_lines.append(f"\nUSER: {payload.content}")
+
+    try:
+        answer = await llm.send_message(UserMessage(text="".join(context_lines)))
+    except Exception as e:
+        logger.exception("Chat send failed")
+        raise HTTPException(status_code=502, detail=f"AI error: {str(e)[:200]}")
+    if not isinstance(answer, str):
+        answer = str(answer)
+
+    assistant_msg = {
+        "message_id": f"msg_{uuid.uuid4().hex[:12]}",
+        "chat_id": chat_id,
+        "user_id": user.user_id,
+        "role": "assistant",
+        "content": answer,
+        "doc_ids": payload.doc_ids or [],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.chat_messages.insert_one(assistant_msg)
+
+    # Auto-title on first turn
+    new_title = chat.get("title")
+    if chat.get("message_count", 0) == 0 and (not new_title or new_title == "New chat"):
+        new_title = payload.content.strip().split("\n")[0][:60] or "New chat"
+
+    await db.chats.update_one(
+        {"chat_id": chat_id, "user_id": user.user_id},
+        {
+            "$set": {"updated_at": assistant_msg["created_at"], "title": new_title},
+            "$inc": {"message_count": 2},
+        },
+    )
+
+    user_msg.pop("_id", None)
+    assistant_msg.pop("_id", None)
+    return {"user_message": user_msg, "assistant_message": assistant_msg, "title": new_title}
+
+
+# ============ Chat share ============
+@api_router.post("/chats/{chat_id}/share")
+async def enable_chat_share(chat_id: str, user: User = Depends(get_current_user)):
+    chat = await db.chats.find_one({"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    slug = chat.get("share_slug")
+    if not slug:
+        for _ in range(5):
+            candidate = _slug()
+            if not await db.chats.find_one({"share_slug": candidate}):
+                slug = candidate
+                break
+    await db.chats.update_one(
+        {"chat_id": chat_id, "user_id": user.user_id},
+        {"$set": {"share_slug": slug, "share_enabled": True, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    return {"share_enabled": True, "share_slug": slug}
+
+
+@api_router.delete("/chats/{chat_id}/share")
+async def disable_chat_share(chat_id: str, user: User = Depends(get_current_user)):
+    res = await db.chats.update_one(
+        {"chat_id": chat_id, "user_id": user.user_id},
+        {"$set": {"share_enabled": False, "updated_at": datetime.now(timezone.utc).isoformat()}},
+    )
+    if res.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    return {"share_enabled": False}
+
+
+@api_router.get("/public/chats/{slug}")
+async def public_chat(slug: str):
+    chat = await db.chats.find_one({"share_slug": slug, "share_enabled": True}, {"_id": 0, "user_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Not available")
+    msgs = await db.chat_messages.find(
+        {"chat_id": chat["chat_id"], "share_enabled": {"$ne": False}}, {"_id": 0, "user_id": 0}
+    ).sort("created_at", 1).to_list(500)
+    # Not filtering on message; grouped under chat's share
+    msgs = await db.chat_messages.find(
+        {"chat_id": chat["chat_id"]}, {"_id": 0, "user_id": 0}
+    ).sort("created_at", 1).to_list(500)
+    return {"chat": chat, "messages": msgs}
+
+
+# ============ Chat export ============
+def _chat_to_text(chat: dict, messages: List[dict]) -> str:
+    lines = [f"# {chat.get('title', 'Chat')}", ""]
+    for m in messages:
+        role = "You" if m["role"] == "user" else "AI"
+        lines.append(f"[{m['created_at']}] {role}:")
+        lines.append(m["content"])
+        lines.append("")
+    lines.append("---")
+    lines.append("Exported from Knowledge-Nexus AI")
+    return "\n".join(lines)
+
+
+@api_router.get("/chats/{chat_id}/export.txt")
+async def export_chat_txt(chat_id: str, user: User = Depends(get_current_user)):
+    chat = await db.chats.find_one({"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    msgs = await db.chat_messages.find(
+        {"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0}
+    ).sort("created_at", 1).to_list(1000)
+    text = _chat_to_text(chat, msgs)
+    return PlainTextResponse(
+        content=text,
+        headers={"Content-Disposition": f'attachment; filename="{re.sub(r"[^a-z0-9-]+","-",chat["title"].lower())}.txt"'},
+    )
+
+
+@api_router.get("/chats/{chat_id}/export.pdf")
+async def export_chat_pdf(chat_id: str, user: User = Depends(get_current_user)):
+    chat = await db.chats.find_one({"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0})
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+    msgs = await db.chat_messages.find(
+        {"chat_id": chat_id, "user_id": user.user_id}, {"_id": 0}
+    ).sort("created_at", 1).to_list(1000)
+
+    from reportlab.lib.pagesizes import LETTER
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.units import inch
+    from reportlab.lib.colors import HexColor
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=LETTER, topMargin=0.7 * inch, bottomMargin=0.7 * inch, leftMargin=0.8 * inch, rightMargin=0.8 * inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("title", parent=styles["Title"], fontSize=20, textColor=HexColor("#7c3aed"))
+    user_style = ParagraphStyle("user", parent=styles["BodyText"], textColor=HexColor("#0369a1"), spaceBefore=10)
+    ai_style = ParagraphStyle("ai", parent=styles["BodyText"], textColor=HexColor("#111827"), spaceBefore=4)
+    meta_style = ParagraphStyle("meta", parent=styles["BodyText"], fontSize=8, textColor=HexColor("#6b7280"))
+
+    story = [Paragraph(chat.get("title", "Chat"), title_style), Spacer(1, 0.15 * inch)]
+    for m in msgs:
+        who = "You" if m["role"] == "user" else "AI"
+        story.append(Paragraph(f"<b>{who}</b> · <font color='#6b7280'>{m['created_at']}</font>", meta_style))
+        # Escape HTML-ish content for reportlab
+        safe = (
+            m["content"]
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\n", "<br/>")
+        )
+        story.append(Paragraph(safe, user_style if m["role"] == "user" else ai_style))
+        story.append(Spacer(1, 0.08 * inch))
+
+    story.append(Spacer(1, 0.2 * inch))
+    story.append(Paragraph("<i>Exported from Knowledge-Nexus AI</i>", meta_style))
+    doc.build(story)
+    buf.seek(0)
+    safe_name = re.sub(r"[^a-z0-9-]+", "-", chat["title"].lower()).strip("-") or "chat"
+    return StreamingResponse(
+        buf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}.pdf"'},
+    )
 
 
 app.include_router(api_router)
