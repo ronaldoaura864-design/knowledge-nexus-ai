@@ -13,7 +13,14 @@ export const PublicPreview = () => {
       .then((r) => (r.ok ? r.json() : Promise.reject()))
       .then(setMeta)
       .catch(() => setError(true));
+    const prev = document.documentElement.classList.contains("dark") ? "dark" : "light";
     document.documentElement.classList.add("dark");
+    return () => {
+      if (prev === "light") {
+        document.documentElement.classList.remove("dark");
+        document.documentElement.classList.add("light");
+      }
+    };
   }, [slug]);
 
   if (error) {

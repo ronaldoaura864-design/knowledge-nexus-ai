@@ -699,7 +699,7 @@ async def export_project_zip(project_id: str, user: User = Depends(get_current_u
 
 # ============ Public Share Link ============
 def _slug() -> str:
-    return secrets.token_urlsafe(9).replace("_", "").replace("-", "")[:12].lower()
+    return secrets.token_hex(6)
 
 
 @api_router.post("/projects/{project_id}/share")
@@ -777,8 +777,8 @@ async def public_site(slug: str):
     name = project.get("name") or "Preview"
     description = project.get("description") or ""
     html_body = project.get("html") or ""
-    css = project.get("css") or ""
-    js = project.get("js") or ""
+    css = (project.get("css") or "").replace("</style>", "<\\/style>")
+    js = (project.get("js") or "").replace("</script>", "<\\/script>")
     doc = (
         "<!doctype html>\n"
         '<html lang="en">\n'
