@@ -1,0 +1,101 @@
+{
+  "theme": "dark-by-default",
+  "typography": {
+    "font_family": {
+      "headings": "Outfit, sans-serif",
+      "body": "Manrope, sans-serif",
+      "mono": "'JetBrains Mono', monospace"
+    },
+    "hierarchy": {
+      "h1": "text-5xl sm:text-6xl font-medium tracking-tight text-white",
+      "h2": "text-3xl sm:text-4xl font-medium tracking-tight text-zinc-100",
+      "h3": "text-xl sm:text-2xl font-medium tracking-tight text-zinc-200",
+      "h4": "text-lg font-medium text-zinc-200",
+      "body": "text-base text-zinc-400 leading-relaxed",
+      "small": "text-sm text-zinc-500",
+      "label": "text-xs font-semibold tracking-[0.2em] uppercase text-zinc-500"
+    },
+    "instructions": "DO NOT use Inter or Roboto. Use Outfit for all headings to give a geometric, high-tech SaaS feel, and Manrope for maximum readability in body copy. Use JetBrains Mono for any code output or prompt areas."
+  },
+  "colors": {
+    "background": {
+      "default": "#09090B",
+      "paper": "#121214",
+      "glass": "rgba(24, 24, 27, 0.4)"
+    },
+    "foreground": {
+      "default": "#FAFAFA",
+      "muted": "#A1A1AA",
+      "inverse": "#09090B"
+    },
+    "accents": {
+      "primary": "#8B5CF6",
+      "secondary": "#3B82F6",
+      "gradient_text": "bg-gradient-to-r from-blue-400 to-purple-500 text-transparent bg-clip-text",
+      "gradient_bg": "bg-gradient-to-r from-blue-600 to-purple-600",
+      "border_glow": "border-purple-500/30"
+    },
+    "instructions": "Follow the 'Godly' dark mode style. Avoid pure black (#000000). Use deep zinc (#09090B). Use the blue/purple gradient sparingly to highlight key elements (like the Main CTA or 'Generate' button). Use 1px subtle borders (border-white/10) to separate sections."
+  },
+  "surfaces_and_glassmorphism": {
+    "glass_panel": "bg-zinc-900/40 backdrop-blur-2xl border border-white/10 shadow-2xl",
+    "card": "bg-zinc-900/20 border border-white/5 rounded-2xl hover:bg-zinc-900/40 transition-colors duration-300",
+    "input": "bg-zinc-950 border border-white/10 rounded-xl focus:border-purple-500/50 focus:ring-1 focus:ring-purple-500/50 transition-all",
+    "instructions": "Never use fully transparent backgrounds for headers or dropdowns. Always apply backdrop-blur-2xl and a 1px border-white/10 to create authentic high-end glassmorphism (like Linear and v0)."
+  },
+  "components": {
+    "buttons": {
+      "primary": "rounded-full bg-gradient-to-r from-blue-600 to-purple-600 text-white font-medium px-6 py-2.5 hover:shadow-[0_0_20px_rgba(139,92,246,0.3)] transition-all transform hover:-translate-y-0.5",
+      "secondary": "rounded-full bg-zinc-800 text-zinc-100 font-medium px-6 py-2.5 border border-white/10 hover:bg-zinc-700 transition-all",
+      "ghost": "rounded-full text-zinc-400 hover:text-zinc-100 hover:bg-zinc-800/50 transition-all px-4 py-2"
+    },
+    "navigation": {
+      "header": "fixed top-0 w-full z-50 bg-zinc-950/60 backdrop-blur-xl border-b border-white/10 h-16 flex items-center justify-between px-6"
+    },
+    "builder_layout": {
+      "sidebar": "w-80 h-[calc(100vh-4rem)] border-r border-white/10 bg-zinc-950/50 flex flex-col p-4",
+      "preview_area": "flex-1 h-[calc(100vh-4rem)] bg-zinc-900 p-4 rounded-tl-3xl border-t border-l border-white/10 overflow-hidden relative"
+    }
+  },
+  "layouts": {
+    "landing_page": {
+      "hero": "Min-h-screen flex flex-col items-center justify-center text-center px-4 relative overflow-hidden. Place abstract purple/blue glowing orbs in the background with strong blur (blur-[100px]).",
+      "features": "Bento Grid layout (grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6 p-8). Mix large showcase cards (col-span-2) and smaller stat/info cards."
+    },
+    "dashboard": {
+      "structure": "Collapsible left sidebar for navigation. Main content area uses a high-density grid for 'My Projects' cards. Header contains User Profile and 'New Project' CTA."
+    },
+    "builder_page": {
+      "structure": "Split pane setup. Left pane (300-350px) contains the chat/prompt interface for generating the website. Right pane takes remaining space and holds an iframe or scaled div showing the Live Preview."
+    }
+  },
+  "motion": {
+    "hover": "All interactive elements must have a smooth hover transition (e.g., transition-all duration-300). Buttons should lift slightly (hover:-translate-y-0.5).",
+    "entrance": "Use Framer Motion to stagger the entrance of Bento Grid items and list items. Fade in and slide up (initial={{ opacity: 0, y: 20 }}).",
+    "microinteractions": "Provide immediate visual feedback for the 'Generate' button (e.g., a glowing border or loading spinner)."
+  },
+  "image_urls": {
+    "hero_background_texture": {
+      "url": "https://images.pexels.com/photos/29716961/pexels-photo-29716961.jpeg",
+      "description": "Abstract composition of colorful light trails in blues and purples. Use this heavily blurred as a background layer in the hero section to create the 'glowing orb' effect."
+    },
+    "feature_workspace": {
+      "url": "https://images.pexels.com/photos/10949676/pexels-photo-10949676.jpeg",
+      "description": "Close-up of a sleek keyboard and smartphone on a dark workspace. Use in a Bento Grid card to represent the 'Pro Developer Tools' or 'Modern Workflow'."
+    }
+  },
+  "accessibility": {
+    "contrast": "Ensure text meets WCAG AA standards. Muted text (zinc-400) against dark bg (zinc-950) is safe, but avoid zinc-600 for small body text.",
+    "focus": "All form inputs and buttons MUST have visible focus states (focus:ring-2 focus:ring-purple-500/50).",
+    "data_testid": "All interactive and key informational elements MUST include a data-testid attribute (e.g., data-testid='generate-website-button')."
+  },
+  "universal_guidelines_for_main_agent": [
+    "Do not use centered text layouts for long paragraphs. Keep reading content left-aligned.",
+    "Implement glassmorphism strictly with backdrop-blur and semi-transparent borders.",
+    "For the Live Preview, build a stylized 'Browser Window' frame around the iframe to make it feel premium.",
+    "Never use pure black (#000) or pure white (#fff) for large surfaces. Use the provided zinc colors.",
+    "Use Phosphor Icons or Lucide-React for all icons, keeping a consistent 1.5px stroke width.",
+    "Avoid the generic 'AI slop' look by ensuring generous padding (p-8, p-12) and precise 1px borders.",
+    "Provide toast notifications using Sonner (e.g., for 'Code Copied to Clipboard' or 'Project Saved')."
+  ]
+}
