@@ -1460,11 +1460,6 @@ async def send_message(
     ).sort("created_at", 1).to_list(200)
 
     session_id = f"chat_{chat_id}"
-    llm = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=session_id,
-        system_message=CHAT_SYSTEM_PROMPT,
-    ).with_model("openai", "gpt-5.2")
 
     # Compose one user message that includes prior turns + docs context
     context_lines = []
@@ -1477,11 +1472,39 @@ async def send_message(
             context_lines.append(f"\n{role}: {m['content']}")
         context_lines.append("\n--- END PRIOR CONVERSATION ---\n")
     context_lines.append(f"\nUSER: {payload.content}")
+    prompt_text = "".join(context_lines)
+
+    # Select model with fallback to default
+    requested_model = (payload.model or DEFAULT_CHAT_MODEL).strip()
+    if requested_model not in CHAT_MODELS:
+        requested_model = DEFAULT_CHAT_MODEL
+    provider = CHAT_MODELS[requested_model]["provider"]
 
     try:
-        answer = await llm.send_message(UserMessage(text="".join(context_lines)))
+        if provider == "gemini":
+            if not GEMINI_API_KEY:
+                await db.chat_messages.delete_one({"message_id": user_msg["message_id"]})
+                raise HTTPException(status_code=503, detail="Gemini not configured — set GEMINI_API_KEY on the server")
+            from google import genai as _genai
+            gclient = _genai.Client(api_key=GEMINI_API_KEY)
+            gresp = await asyncio.to_thread(
+                gclient.models.generate_content,
+                model=requested_model,
+                contents=f"{CHAT_SYSTEM_PROMPT}\n\n{prompt_text}",
+            )
+            answer = getattr(gresp, "text", None) or ""
+        else:
+            llm = LlmChat(
+                api_key=EMERGENT_LLM_KEY,
+                session_id=session_id,
+                system_message=CHAT_SYSTEM_PROMPT,
+            ).with_model("openai", "gpt-5.2")
+            answer = await llm.send_message(UserMessage(text=prompt_text))
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Chat send failed")
+        await db.chat_messages.delete_one({"message_id": user_msg["message_id"]})
         raise HTTPException(status_code=502, detail=f"AI error: {str(e)[:200]}")
     if not isinstance(answer, str):
         answer = str(answer)
