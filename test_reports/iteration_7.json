@@ -1,0 +1,76 @@
+{
+  "summary": "Iteration 7 (Gemini model selector) — Partial pass. GET /api/settings/models (7/7 contract points) works: default='gpt-5.2', both models listed, gpt-5.2 available=true, gemini-2.5-flash available=false (GEMINI_API_KEY empty). Frontend model selector on /chat is correctly wired: visible below input, shows 'GPT-5.2 (OpenAI)' as default, dropdown lists both models, Gemini entry shows 'Gemini 2.5 Flash (Google) · not configured' with aria-disabled=true, kn_chat_model persistence code path present. All 48 Phase 1 regression tests still pass (no breakage). CRITICAL: The core new backend contract of this iteration — POST /api/chats/{id}/messages with model='gemini-2.5-flash' returning 503 'Gemini not configured' AND rolling back the orphan user_message — is NOT implemented in /app/backend/server.py::send_message. The endpoint ignores payload.model entirely and always routes to the OpenAI/emergentintegrations path. Result: model='gemini-2.5-flash' returns 502 (OpenAI budget-exceeded) instead of 503, and the orphan user_message row remains in chat_messages. Additionally, `requested_model` is referenced at line 1496 but never defined earlier in the function — this is a NameError latent bug that will 500 on every successful send once the OpenAI budget is topped up. Unknown-model fallback logic is also absent. blocked/unverified: real OpenAI path (both default and explicit gpt-5.2 tests skipped — needs-key-or-topup, EMERGENT_LLM_KEY still budget-blocked as in iteration 6).",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/chats/{id}/messages",
+        "issue": "Gemini routing NOT implemented. Spec requires: when payload.model=='gemini-2.5-flash' AND GEMINI_API_KEY empty -> HTTPException 503 'Gemini not configured — set GEMINI_API_KEY on the server' AND rollback user_msg. Actual behavior: payload.model is ignored, request routes to OpenAI/emergentintegrations, returns 502 (budget-exceeded), and orphan user_message is persisted. Verified via test_gemini_selected_returns_503_and_rolls_back_user_msg (FAILED: got 502, expected 503; and chat.messages count went from 0 -> 1). See /app/backend/server.py lines 1429-1516 — no branch on payload.model exists between line 1447 (insert user_msg) and line 1467 (.with_model('openai','gpt-5.2')).",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "POST /api/chats/{id}/messages",
+        "issue": "NameError latent bug: line 1496 has `\"model\": requested_model,` in the assistant_msg dict, but `requested_model` is never assigned anywhere in send_message (nor defined as a module global). Currently masked because the LLM call at line 1482 always raises (budget block) before reaching line 1496. Once EMERGENT_LLM_KEY is topped up, every successful send will crash with `NameError: name 'requested_model' is not defined` -> 500. Fix: assign `requested_model = payload.model if payload.model in CHAT_MODELS else DEFAULT_CHAT_MODEL` at the top of the function.",
+        "priority": "CRITICAL"
+      },
+      {
+        "endpoint": "POST /api/chats/{id}/messages",
+        "issue": "Unknown/invalid model fallback NOT implemented. Spec requires unknown model to silently fall back to gpt-5.2. Actual: since payload.model is ignored, unknown values also route to gpt-5.2 accidentally — BUT once bug #2 (requested_model NameError) is fixed, if fallback logic isn't added, assistant_msg.model would echo the invalid value or crash. Related to fix for #2.",
+        "priority": "HIGH"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/chats/{id}/messages",
+        "issue": "Existing Phase 1 issue still present: on any LLM failure (budget/timeout/gemini-not-configured), the just-inserted user_message is NOT deleted. Same as iteration 6 minor. Fixing this is required as part of the Gemini rollback contract anyway (see critical #1)."
+      }
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Chat send with gemini selected while unavailable",
+        "issue": "unverified end-to-end: cannot be exercised because (a) UI correctly marks the gemini SelectItem aria-disabled=true so a normal user cannot pick it, and (b) even if forced (via localStorage.setItem('kn_chat_model','gemini-2.5-flash')), the backend does not return 503 -> the 'shows 503 toast + no orphan user message' assertion cannot be verified until the backend Gemini branch is implemented.",
+        "affected_selectors": ["[data-testid=\"model-option-gemini-2.5-flash\"]", "[data-testid=\"send-message-btn\"]"]
+      },
+      {
+        "flow": "Chat send with default model (gpt-5.2)",
+        "issue": "unverified: needs-key-or-topup — EMERGENT_LLM_KEY still budget-blocked ('Budget has been exceeded! Current cost: 1.28954525, Max budget: 1.16'). Send returns 502 from backend. UI optimistic bubble stays visible (should be filtered out on error). Toast error not visibly shown to the user on the 502 response — the catch block on Chat.jsx line 181-183 does `toast.error(err.response?.data?.detail || 'Send failed')`, but when Cloudflare intercepts the 502 with HTML, `err.response.data.detail` is undefined so it should fall through to 'Send failed'. Playwright didn't detect a toast DOM node after the 502 — may be timing (toast auto-dismiss) or portal selector miss. Recommend main agent add a small delay verification manually.",
+        "affected_selectors": ["[data-testid=\"send-message-btn\"]"]
+      }
+    ],
+    "design_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_gemini_iteration7.py",
+    "/app/backend/tests/test_phase1_features.py",
+    "/app/test_reports/pytest/pytest_iteration7.xml",
+    "/app/test_reports/pytest/pytest_iter7_regression.xml"
+  ],
+  "action_items": [
+    "CRITICAL: Implement the Gemini model routing branch in /app/backend/server.py::send_message. Between the user_msg insert (line 1447) and the LlmChat construction (line 1463), add:\n  requested_model = (payload.model or DEFAULT_CHAT_MODEL)\n  if requested_model not in CHAT_MODELS:\n      requested_model = DEFAULT_CHAT_MODEL\n  if requested_model == 'gemini-2.5-flash':\n      if not GEMINI_API_KEY:\n          # roll back orphan user_msg\n          await db.chat_messages.delete_one({'message_id': user_msg['message_id']})\n          raise HTTPException(status_code=503, detail='Gemini not configured — set GEMINI_API_KEY on the server')\n      # else call google-genai SDK: from google import genai; client=genai.Client(api_key=GEMINI_API_KEY); resp=client.models.generate_content(model='gemini-2.5-flash', contents=...). Set answer=resp.text.\nThen at line 1496 `\"model\": requested_model` will work correctly. Currently `requested_model` is undefined so this is also a latent NameError once OpenAI budget is topped up.",
+    "CRITICAL: Even for the OpenAI path (existing gpt-5.2), define `requested_model = 'gpt-5.2'` (or the input value if in CHAT_MODELS) so line 1496 doesn't NameError on success. Currently masked only by budget block.",
+    "HIGH: Also delete orphan user_message on OpenAI failure (existing minor from iteration 6), so chat_messages doesn't accumulate half-turns. This is now double-relevant since the Gemini branch is required to do the same rollback.",
+    "TOP UP or ROTATE EMERGENT_LLM_KEY — still exceeds budget ('$1.28 spent > $1.16 cap'), same as iteration 6. Real end-to-end LLM assertions (assistant reply for default/gpt-5.2 path, model field in response) remain unverified.",
+    "(Nice-to-have) Frontend Chat.jsx toast on send failure: verify visually that toast.error is actually being rendered on 502 responses — Playwright couldn't find toast DOM elements after send failure. Possibly related to the toast library's portal or a race with re-render; not blocking."
+  ],
+  "critical_code_review_comments": [
+    "server.py::send_message (line 1429-1516) — model routing branch is entirely missing. payload.model is never read. Line 1467 hard-codes `.with_model('openai','gpt-5.2')`. Line 1496 uses `requested_model` which is undefined -> latent NameError. Fix as described in action items #1-2.",
+    "server.py — google-genai SDK is not imported and not in requirements.txt. Since GEMINI_API_KEY is empty for this iteration the SDK isn't strictly needed until real Gemini calls happen, BUT the 503-not-configured branch must still be implemented (no SDK required for that).",
+    "server.py::send_message — even with the current gpt-5.2-only code path, on LLM failure the user_msg row stays in chat_messages (no rollback). This must be addressed as part of the Gemini rollback contract.",
+    "Chat.jsx model selector (line 579-601) — correctly wired for happy path. Minor: kn_chat_model is not set in localStorage on initial mount when the default is already selected (line 92-96 only writes it when a fallback occurs). Since the useState initializer already reads from localStorage or defaults to 'gpt-5.2', this is harmless but slightly inconsistent — first-load users will have no localStorage entry until they explicitly change selection."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_gemini_iteration7.py"
+  ],
+  "success_rate": {
+    "backend": "6/7 pass (86%) — 3/3 settings-models contract PASS; 1/4 model-routing tests FAIL (gemini 503+rollback expected 503 got 502, chat_messages count 0->1), 3/4 model-routing SKIPPED (openai budget-blocked). 48/48 phase1 regression PASS. Real-LLM (gpt-5.2 assistant reply, model field on response) unverified: needs-key-or-topup.",
+    "frontend": "5/5 model-selector UI checks PASS (visible, default label, both options rendered, gemini disabled+not-configured text, gpt clickable). Real send end-to-end unverified: needs-key-or-topup + backend Gemini branch missing."
+  },
+  "test_credentials": "Backend pytest: fresh /api/auth/register users per test module (auto-cleaned). Frontend Playwright: registered fresh user (e.g., fe_it7_<ts>@example.com / SuperSecret123!).",
+  "seed_data_creation": "None new; test_gemini_iteration7.py auto-provisions user + chat and cleans via gm_user fixture teardown.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Iteration 7 = Gemini optional-provider addition. Backend contract WORKS for GET /api/settings/models (public, no auth, returns default+2 models with correct available flags based on env vars). Frontend Chat.jsx model selector WORKS (dropdown with both options, gemini disabled+not-configured, kn_chat_model localStorage on change). BROKEN: send_message backend routing — payload.model is never read; no gemini-503 branch; no rollback; no fallback for unknown model; latent `requested_model` NameError on line 1496. To re-verify after fix: run `pytest /app/backend/tests/test_gemini_iteration7.py -v` — the 4 model-routing tests should pass (currently 1 fails, 3 skip). Also run `pytest /app/backend/tests/test_phase1_features.py -v -k 'not Real and not real'` to confirm 48/48 phase1 regression stays green. Real-LLM tests (TestChatSendReal, TestImagesReal) still blocked by EMERGENT_LLM_KEY budget cap.",
+  "rca of the issue": "ROOT CAUSE: /app/backend/server.py::send_message (lines 1429-1516) was NOT updated for the Gemini model routing contract. Only the CHAT_MODELS dict (line 42-46) and GET /api/settings/models (line 188-196) endpoint were added, plus the frontend Select. The endpoint still hard-codes `.with_model('openai','gpt-5.2')` at line 1467 and references an undefined `requested_model` variable at line 1496. Repro: `curl -X POST -H 'Authorization: Bearer <jwt>' -H 'Content-Type: application/json' $BASE/api/chats/<id>/messages -d '{\"content\":\"hi\",\"model\":\"gemini-2.5-flash\"}'` returns 502 (Cloudflare-wrapped 502 from FastAPI's HTTPException(502) triggered by OpenAI budget error) instead of 503 'Gemini not configured'. Subsequent GET /api/chats/<id> shows one orphan user message. Mitigation: implement the branch described in action item #1 — this is a small, well-defined change and does not require the google-genai SDK for the 'not configured' path."
+}

@@ -23,6 +23,13 @@ import {
   ArrowLeft,
 } from "lucide-react";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   Dialog,
   DialogContent,
   DialogDescription,
@@ -49,6 +56,8 @@ export const Chat = () => {
   const [renameOpen, setRenameOpen] = useState(false);
   const [renameTitle, setRenameTitle] = useState("");
   const [shareOpen, setShareOpen] = useState(false);
+  const [availableModels, setAvailableModels] = useState([]);
+  const [selectedModel, setSelectedModel] = useState(() => localStorage.getItem("kn_chat_model") || "gpt-5.2");
   const messagesEndRef = useRef(null);
   const fileInputRef = useRef(null);
 
@@ -76,6 +85,16 @@ export const Chat = () => {
   useEffect(() => {
     loadChats();
     loadDocs();
+    // Load available AI models
+    api.get("/settings/models").then((r) => {
+      setAvailableModels(r.data.models || []);
+      // If selected model unavailable, fall back to default
+      const selectedAvail = r.data.models?.find((m) => m.id === selectedModel)?.available;
+      if (!selectedAvail) {
+        setSelectedModel(r.data.default);
+        localStorage.setItem("kn_chat_model", r.data.default);
+      }
+    }).catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -148,6 +167,7 @@ export const Chat = () => {
       const r = await api.post(`/chats/${activeId}/messages`, {
         content: text,
         doc_ids: selectedDocIds,
+        model: selectedModel,
       });
       setMessages((m) => [
         ...m.filter((x) => x.message_id !== tempUser.message_id),
@@ -552,8 +572,33 @@ export const Chat = () => {
                   {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                 </Button>
               </div>
-              <div className="text-[11px] text-muted-foreground text-center mt-2">
-                AI responses may be inaccurate. Powered by GPT-5.2.
+              <div className="flex items-center justify-between mt-2 gap-2 flex-wrap">
+                <div className="text-[11px] text-muted-foreground">
+                  AI responses may be inaccurate.
+                </div>
+                <Select
+                  value={selectedModel}
+                  onValueChange={(v) => {
+                    setSelectedModel(v);
+                    localStorage.setItem("kn_chat_model", v);
+                  }}
+                >
+                  <SelectTrigger data-testid="model-selector" className="h-7 w-auto min-w-[180px] text-xs rounded-full border-white/10 bg-transparent">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {availableModels.map((m) => (
+                      <SelectItem
+                        key={m.id}
+                        value={m.id}
+                        disabled={!m.available}
+                        data-testid={`model-option-${m.id}`}
+                      >
+                        {m.label}{!m.available ? " · not configured" : ""}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
               </div>
             </div>
           </div>

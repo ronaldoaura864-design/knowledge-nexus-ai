@@ -33,9 +33,17 @@ db = client[os.environ["DB_NAME"]]
 EMERGENT_LLM_KEY = os.environ.get("EMERGENT_LLM_KEY", "")
 GITHUB_CLIENT_ID = os.environ.get("GITHUB_CLIENT_ID", "")
 GITHUB_CLIENT_SECRET = os.environ.get("GITHUB_CLIENT_SECRET", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 JWT_SECRET = os.environ.get("JWT_SECRET", "insecure-dev-secret")
 JWT_ALGO = "HS256"
 JWT_EXP_DAYS = 30
+
+# Available chat models
+CHAT_MODELS = {
+    "gpt-5.2": {"provider": "openai", "label": "GPT-5.2 (OpenAI)", "available": bool(EMERGENT_LLM_KEY)},
+    "gemini-2.5-flash": {"provider": "gemini", "label": "Gemini 2.5 Flash (Google)", "available": bool(GEMINI_API_KEY)},
+}
+DEFAULT_CHAT_MODEL = "gpt-5.2"
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -103,6 +111,7 @@ class ChatUpdateRequest(BaseModel):
 class SendMessageRequest(BaseModel):
     content: str
     doc_ids: Optional[List[str]] = None
+    model: Optional[str] = None
 
 
 class Project(BaseModel):
@@ -174,6 +183,17 @@ async def get_current_user(
 @api_router.get("/")
 async def root():
     return {"message": "Knowledge-Nexus AI is running"}
+
+
+@api_router.get("/settings/models")
+async def list_chat_models():
+    return {
+        "default": DEFAULT_CHAT_MODEL,
+        "models": [
+            {"id": mid, "label": m["label"], "provider": m["provider"], "available": m["available"]}
+            for mid, m in CHAT_MODELS.items()
+        ],
+    }
 
 
 @api_router.post("/auth/session")
@@ -1473,6 +1493,7 @@ async def send_message(
         "role": "assistant",
         "content": answer,
         "doc_ids": payload.doc_ids or [],
+        "model": requested_model,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.chat_messages.insert_one(assistant_msg)
