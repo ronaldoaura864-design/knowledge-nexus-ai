@@ -1,3 +1,4 @@
+# Vercel Build Trigger - All emergentintegrations references removed. Dependencies verified clean.
 from fastapi import FastAPI, APIRouter, HTTPException, Request, Response, Cookie, Header, Depends, UploadFile, File, Form
 from fastapi.responses import StreamingResponse, RedirectResponse, HTMLResponse, PlainTextResponse
 from dotenv import load_dotenv
