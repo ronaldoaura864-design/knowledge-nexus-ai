@@ -20,7 +20,29 @@ import httpx
 import bcrypt
 import jwt as pyjwt
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+try:
+    from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
+    EMERGENT_INTEGRATIONS_AVAILABLE = True
+except ImportError:
+    EMERGENT_INTEGRATIONS_AVAILABLE = False
+
+    class UserMessage:
+        def __init__(self, text: str = ""):
+            self.text = text
+
+    class ImageContent:
+        def __init__(self, content: str = ""):
+            self.content = content
+
+    class LlmChat:
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("emergentintegrations is not installed")
+
+        def with_model(self, provider, model):
+            raise RuntimeError("emergentintegrations is not installed")
+
+        async def send_message(self, *args, **kwargs):
+            raise RuntimeError("emergentintegrations is not installed")
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -40,8 +62,16 @@ JWT_EXP_DAYS = 30
 
 # Available chat models
 CHAT_MODELS = {
-    "gpt-5.2": {"provider": "openai", "label": "GPT-5.2 (OpenAI)", "available": bool(EMERGENT_LLM_KEY)},
-    "gemini-2.5-flash": {"provider": "gemini", "label": "Gemini 2.5 Flash (Google)", "available": bool(GEMINI_API_KEY)},
+    "gpt-5.2": {
+        "provider": "openai",
+        "label": "GPT-5.2 (OpenAI)",
+        "available": bool(EMERGENT_LLM_KEY and EMERGENT_INTEGRATIONS_AVAILABLE),
+    },
+    "gemini-2.5-flash": {
+        "provider": "gemini",
+        "label": "Gemini 2.5 Flash (Google)",
+        "available": bool(GEMINI_API_KEY),
+    },
 }
 DEFAULT_CHAT_MODEL = "gpt-5.2"
 
